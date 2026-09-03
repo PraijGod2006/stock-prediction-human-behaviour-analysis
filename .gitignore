@@ -1,0 +1,49 @@
+
+# Virtual environments
+.venv/
+venv/
+shitimon/
+ENV/
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter temporary files
+.ipynb_checkpoints/
+
+# Local data and generated files
+data/
+outputs/
+models/
+*.csv
+*.json
+*.parquet
+*.zip
+*.7z
+*.pth
+*.pt
+*.onnx
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Tool and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Build and test files
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
