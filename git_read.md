@@ -281,6 +281,11 @@ git remote set-url origin https://github.com/USERNAME/REPOSITORY.git
 ```
 
 Upload the `main` branch for the first time. `-u` remembers the connection, so later `git push` can be shorter:
+BEFORE THIS -- DO - 
+git add .
+git commit -m ""
+git oush -u origin main
+
 
 ```cmd
 git push -u origin main
