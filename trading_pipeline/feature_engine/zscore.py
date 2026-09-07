@@ -25,29 +25,40 @@ To ensure 100% zero lookahead bias:
 
 import numpy as np
 import pandas as pd
+import numpy as np
 from typing import Optional
 
 
 class ZScoreCalculator:
     """
+    Calculates various Z-scores with lookahead bias prevention by applying shift(1).
+    All methods reset their rolling statistics at session boundaries (> 4 hour gaps).
     Computes 14 distinct Z-score feature transformations.
     All rolling statistics use .shift(1) to strictly eliminate lookahead bias.
     All windows reset at trading session boundaries (gaps > 4 hours).
     """
+    
 
     def _get_session_groups(self, index: pd.DatetimeIndex) -> pd.Series:
         """
+        Detects session boundaries by finding gaps > 4 hours in the index.
+        Returns a group ID series used for groupby operations.
         Identifies session boundaries by detecting gaps > 4 hours in the DatetimeIndex.
         Returns unique session integer IDs for groupby operations.
         
         Args:
+            index (pd.DatetimeIndex): The datetime index of the dataframe.
             index: DatetimeIndex of the series/dataframe.
             
         Returns:
+            pd.Series: Integer series representing session group IDs.
             pd.Series: Integer series indicating session membership.
         """
+        # Calculate time difference between consecutive rows
         tdelta = index.to_series().diff()
+        # Create a boolean mask where difference > 4 hours
         new_session = tdelta > pd.Timedelta(hours=4)
+        # Cumulative sum to create unique group IDs for each session
         return new_session.cumsum()
 
     # -------------------------------------------------------------------------
@@ -55,11 +66,30 @@ class ZScoreCalculator:
     # -------------------------------------------------------------------------
     def basic_zscore(self, series: pd.Series, window: int = 20) -> pd.Series:
         """
+        Calculates basic Z-score with rolling logic.
+        Formula: Z = (X - mu) / sigma
+        
+        Args:
+            series (pd.Series): Input data series, expected to have a DatetimeIndex.
+            window (int): Window size. Default is 20.
+            
+        Returns:
+            pd.Series: Z-score series.
         Formula 1: Basic Z-Score using SAMPLE standard deviation s (ddof=1).
             Z_t = (X_t - mu_{t-1}) / s_{t-1}
         Divides by N - 1, producing an unbiased estimator for sample variance.
         """
+        # Group by sessions
         groups = self._get_session_groups(series.index)
+        
+        # Calculate rolling mean and std within each group, and shift(1) to prevent lookahead
+        # Shift is applied after rolling to ensure t's value is not in t's mean/std
+        rolling_mean = series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=1).mean().shift(1))
+        rolling_std = series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std().shift(1))
+        
+        # Calculate Z-score
+        zscore = (series - rolling_mean) / rolling_std
+        return zscore
         mean = series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=1).mean().shift(1))
         std = series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std(ddof=1).shift(1))
         return (series - mean) / std.replace(0, np.nan)
@@ -69,6 +99,24 @@ class ZScoreCalculator:
     # -------------------------------------------------------------------------
     def rolling_zscore(self, series: pd.Series, window: int = 20) -> pd.Series:
         """
+        Calculates rolling Z-score using POPULATION standard deviation (ddof=0).
+        
+        This is distinct from basic_zscore which uses SAMPLE std (ddof=1, Pandas default).
+        Population std divides by N instead of N-1, producing slightly smaller variance
+        estimates. This matters for short windows where N-1 vs N makes a meaningful difference.
+        
+        Formula: Z_t = (X_t - mu_(t,N)) / sigma_pop_(t,N)
+        where sigma_pop uses ddof=0 (divides by N, not N-1).
+        
+        AUDIT FIX: Was previously an exact copy of basic_zscore (return self.basic_zscore).
+        Now uses ddof=0 for population standard deviation.
+        
+        Args:
+            series (pd.Series): Input data series, expected to have a DatetimeIndex.
+            window (int): Lookback window size. Default is 20.
+            
+        Returns:
+            pd.Series: Rolling Z-score series with population sigma.
         Formula 2: Rolling Z-Score using POPULATION standard deviation sigma (ddof=0).
             Z_t = (X_t - mu_{t-1}) / sigma_{t-1}
         Divides by N (not N-1). Mathematically distinct from basic_zscore.
@@ -76,6 +124,17 @@ class ZScoreCalculator:
         the entire population of states in that fixed window.
         """
         groups = self._get_session_groups(series.index)
+        
+        # Population std (ddof=0) vs sample std (ddof=1) in basic_zscore
+        rolling_mean = series.groupby(groups).transform(
+            lambda x: x.rolling(window=window, min_periods=1).mean().shift(1)
+        )
+        rolling_std = series.groupby(groups).transform(
+            lambda x: x.rolling(window=window, min_periods=2).std(ddof=0).shift(1)
+        )
+        
+        zscore = (series - rolling_mean) / rolling_std
+        return zscore
         mean = series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=1).mean().shift(1))
         std = series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std(ddof=0).shift(1))
         return (series - mean) / std.replace(0, np.nan)
@@ -85,13 +144,32 @@ class ZScoreCalculator:
     # -------------------------------------------------------------------------
     def return_zscore(self, price_series: pd.Series, window: int = 20) -> pd.Series:
         """
+        Calculates Z-score of simple returns.
+        Formula: Simple return R_t = (P_t - P_(t-1))/P_(t-1)
+                 Z_(R,t) = (R_t - mu_R) / sigma_R
+        
+        Args:
+            price_series (pd.Series): Price series, expected to have a DatetimeIndex.
+            window (int): Lookback window size. Default is 20.
+            
+        Returns:
+            pd.Series: Z-score of returns.
         Formula 3: Z-score of simple returns.
             R_t = (P_t - P_{t-1}) / P_{t-1}
             Z_{R,t} = (R_t - mu_{R, t-1}) / sigma_{R, t-1}
         Captures short-term linear return momentum and exhaustion.
         """
         groups = self._get_session_groups(price_series.index)
+        
+        # Calculate simple returns within sessions
         returns = price_series.groupby(groups).transform(lambda x: x.pct_change())
+        
+        # We need to shift(1) rolling mean and std of returns
+        rolling_mean = returns.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=1).mean().shift(1))
+        rolling_std = returns.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std().shift(1))
+        
+        zscore = (returns - rolling_mean) / rolling_std
+        return zscore
         mean = returns.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=1).mean().shift(1))
         std = returns.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std().shift(1))
         return (returns - mean) / std.replace(0, np.nan)
@@ -101,12 +179,32 @@ class ZScoreCalculator:
     # -------------------------------------------------------------------------
     def log_return_zscore(self, price_series: pd.Series, window: int = 20) -> pd.Series:
         """
+        Calculates Z-score of log returns.
+        Formula: Log return r_t = ln(P_t/P_(t-1))
+                 Z_(r,t) = (r_t - mu_r) / sigma_r
+        
+        Args:
+            price_series (pd.Series): Price series, expected to have a DatetimeIndex.
+            window (int): Lookback window size. Default is 20.
+            
+        Returns:
+            pd.Series: Z-score of log returns.
         Formula 4: Z-score of continuously compounded logarithmic returns.
             r_t = ln(P_t / P_{t-1})
             Z_{r,t} = (r_t - mu_{r, t-1}) / sigma_{r, t-1}
         Log returns are additive across time and symmetric for gains/losses.
         """
         groups = self._get_session_groups(price_series.index)
+        
+        # Calculate log returns within sessions
+        log_returns = price_series.groupby(groups).transform(lambda x: np.log(x / x.shift(1)))
+        
+        # Shift(1) rolling mean and std
+        rolling_mean = log_returns.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=1).mean().shift(1))
+        rolling_std = log_returns.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std().shift(1))
+        
+        zscore = (log_returns - rolling_mean) / rolling_std
+        return zscore
         log_ret = price_series.groupby(groups).transform(lambda x: np.log(x / x.shift(1)))
         mean = log_ret.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=1).mean().shift(1))
         std = log_ret.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std().shift(1))
@@ -117,6 +215,15 @@ class ZScoreCalculator:
     # -------------------------------------------------------------------------
     def volume_zscore(self, volume_series: pd.Series, window: int = 20) -> pd.Series:
         """
+        Calculates Z-score of volume.
+        Formula: Z_(V,t) = (V_t - mu_V) / sigma_V
+        
+        Args:
+            volume_series (pd.Series): Volume series, expected to have a DatetimeIndex.
+            window (int): Lookback window size. Default is 20.
+            
+        Returns:
+            pd.Series: Z-score of volume.
         Formula 5: Z-score of trading volume.
             Z_{V,t} = (V_t - mu_{V, t-1}) / sigma_{V, t-1}
         Detects unusual volume bursts indicating institutional participation or stop cascades.
@@ -128,6 +235,15 @@ class ZScoreCalculator:
     # -------------------------------------------------------------------------
     def volatility_zscore(self, return_series: pd.Series, window: int = 20) -> pd.Series:
         """
+        Calculates Z-score of rolling volatility (standard deviation of returns).
+        Formula: sigma_t = Std of returns over window, then Z_(sigma,t)
+        
+        Args:
+            return_series (pd.Series): Return series, expected to have a DatetimeIndex.
+            window (int): Lookback window size. Default is 20.
+            
+        Returns:
+            pd.Series: Z-score of volatility.
         Formula 6: Z-score of rolling return volatility.
             sigma_t = Std(R_{t-window:t-1})
             Z_{sigma,t} = (sigma_t - mu_{sigma, t-1}) / sigma_{sigma, t-1}
@@ -135,6 +251,18 @@ class ZScoreCalculator:
         between low-volatility consolidation and high-volatility expansion.
         """
         groups = self._get_session_groups(return_series.index)
+        
+        # Calculate rolling volatility within sessions. 
+        # Shift(1) the rolling calculation so it does not see t
+        volatility = return_series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std().shift(1))
+        
+        # Now we want the Z-score of the volatility itself.
+        # This requires rolling mean and std of the volatility, shifted.
+        rolling_mean = volatility.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=1).mean().shift(1))
+        rolling_std = volatility.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std().shift(1))
+        
+        zscore = (volatility - rolling_mean) / rolling_std
+        return zscore
         # Shift(1) rolling std of returns to prevent leakage
         vol = return_series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std().shift(1))
         mean_vol = vol.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=1).mean().shift(1))
@@ -146,12 +274,27 @@ class ZScoreCalculator:
     # -------------------------------------------------------------------------
     def price_vs_ma_zscore(self, price_series: pd.Series, window: int = 20) -> pd.Series:
         """
+        Calculates Z-score of price relative to its moving average.
+        Formula: MA = rolling mean, Z = (P - MA) / rolling_std
+        
+        Args:
+            price_series (pd.Series): Price series, expected to have a DatetimeIndex.
+            window (int): Lookback window size. Default is 20.
+            
+        Returns:
+            pd.Series: Z-score of price vs MA.
         Formula 7: Z-score of current price relative to its historical moving average.
             Z_{P, MA} = (P_t - MA_{t-1}) / sigma_{P, t-1}
         Classic mean-reversion indicator measuring distance from fair value in units of std dev.
         """
         groups = self._get_session_groups(price_series.index)
+        
+        # Calculate rolling mean and std, shift(1) to avoid leakage
         ma = price_series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=1).mean().shift(1))
+        rolling_std = price_series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std().shift(1))
+        
+        zscore = (price_series - ma) / rolling_std
+        return zscore
         std = price_series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std().shift(1))
         return (price_series - ma) / std.replace(0, np.nan)
 
@@ -160,11 +303,23 @@ class ZScoreCalculator:
     # -------------------------------------------------------------------------
     def spread_zscore(self, price_a: pd.Series, price_b: pd.Series, beta: float = 1.0, window: int = 20) -> pd.Series:
         """
+        Calculates Z-score of a spread between two assets.
+        Formula: S = P_A - beta*P_B, Z = (S - mu_S) / sigma_S
+        
+        Args:
+            price_a (pd.Series): Price series for asset A.
+            price_b (pd.Series): Price series for asset B.
+            beta (float): Hedge ratio or multiplier. Default is 1.0.
+            window (int): Lookback window size. Default is 20.
+            
+        Returns:
+            pd.Series: Z-score of the spread.
         Formula 8: Z-score of the statistical arbitrage cointegration spread.
             Spread_t = P_A,t - beta * P_B,t
             Z_{S,t} = (Spread_t - mu_{S, t-1}) / sigma_{S, t-1}
         Essential for pairs trading and cross-asset relative value strategies.
         """
+        # Calculate spread
         spread = price_a - beta * price_b
         return self.basic_zscore(spread, window)
 

@@ -74,12 +74,17 @@ def validate_and_clean(df: pl.DataFrame, symbol: str) -> tuple[pl.DataFrame, pl.
     df = df.with_columns(pl.lit(symbol).alias("symbol"))
     
     # --- Check 1: Negative Spreads (high < low) ---
+    # In a real market, the highest price in a bar MUST be >= the lowest price.
+    # If high < low, the data is corrupt.
     negative_spread = df.filter(pl.col("high") < pl.col("low"))
     
     # --- Check 2: Zero Volume Bars ---
+    # A zero-volume bar means no trades happened. This can be valid (pre-market)
+    # but during trading hours it usually means the data feed dropped.
     zero_volume = df.filter(pl.col("volume") == 0)
     
     # --- Check 3: Duplicate Timestamps ---
+    # The same minute should not appear twice. If it does, we keep the first.
     duplicates = df.filter(pl.col("date").is_duplicated())
     
     # --- Check 4: Null Values ---
@@ -92,6 +97,7 @@ def validate_and_clean(df: pl.DataFrame, symbol: str) -> tuple[pl.DataFrame, pl.
     
     # Combine all error rows for logging
     error_dfs = [negative_spread, zero_volume, duplicates, nulls]
+    # Filter out empty DataFrames before concatenation
     non_empty_errors = [e for e in error_dfs if len(e) > 0]
     
     if non_empty_errors:
@@ -100,6 +106,7 @@ def validate_and_clean(df: pl.DataFrame, symbol: str) -> tuple[pl.DataFrame, pl.
         errors = pl.DataFrame(schema=df.schema)
     
     # --- Clean the data ---
+    # Remove all flagged rows and deduplicate by timestamp
     clean = (
         df
         .filter(pl.col("high") >= pl.col("low"))         # Remove negative spreads

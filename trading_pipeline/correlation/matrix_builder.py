@@ -102,6 +102,7 @@ class CorrelationMatrixBuilder:
         spike_pdf = (pdf.abs() > 0.002).astype(float)
         spike_corr = spike_pdf.corr(method="pearson")
         
+        # Save raw correlation matrix to artifacts directory
         # Save all 3 correlation matrices to artifacts directory
         raw_corr_path = os.path.join(self.artifacts_dir, "correlation_matrix.parquet")
         raw_corr.to_parquet(raw_corr_path)

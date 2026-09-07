@@ -1,16 +1,28 @@
 """
 ========================================================================================
+INFERENCE: 3-Model Signal Combiner & Trade Decision Engine
 INFERENCE: 3-Model Signal Combiner & Risk-Managed Execution Engine
 ========================================================================================
+This is the final script that brings all three models together to make actual
+trading decisions.
 This is the production inference engine that combines all three models and applies
 full quantitative risk controls.
 
+DECISION LOGIC (from the spec):
+1. Model 1 (Direction) tells us: "Is the market going UP or DOWN?"
+2. Model 2 (Price) tells us: "By exactly how much will it move?"
+3. Model 3 (Exhaustion) tells us: "Is the market about to snap back?"
 DECISION LOGIC (from Specification Section 5):
 1. Model 1 (Direction): Up/Down probability classifier for next 5-minute close.
 2. Model 2 (Price): Regression prediction of next 1-minute return (Section 13 alignment).
 3. Model 3 (Exhaustion): Forward 10-minute maximum expected drawdown.
 
 THE COMBINATION RULE:
+If Model 1 predicts UP **AND** Model 3 detects a sharp incoming drop (exhaustion):
+→ This is a MEAN REVERSION setup. The market is temporarily dipping but will bounce.
+→ We calculate a limit order entry price BELOW the current price:
+   Entry Price = Current Mid-Price * (1 - Model3_Predicted_Drop%)
+→ We buy the dip at the limit price and ride the bounce predicted by Model 1.
 - If Model 1 predicts UP AND Model 3 detects a sharp incoming drawdown (< -0.3%):
   -> MEAN REVERSION BUY: Market is experiencing a temporary liquidity flush.
   -> Limit Entry Formula: Current Mid-Price * (1 - abs(Predicted_Drawdown))
@@ -20,6 +32,7 @@ THE COMBINATION RULE:
 - If Model 1 predicts DOWN with high confidence (> 0.60):
   -> MOMENTUM SELL: Enter short or exit longs.
 
+This is one of the most profitable setups in professional quantitative trading.
 RISK CONTROLS (Section 11):
 - Kill Switch: HALTS ALL TRADING immediately if 'artifacts/KILL_SWITCH' exists.
 - Circuit Breaker: Auto-stops if daily drawdown reaches -2%.
@@ -38,13 +51,14 @@ import pandas as pd
 from datetime import datetime
 from typing import Dict, Any, Optional
 
+# Add the trading_pipeline directory to the Python path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models.model_1_direction import DirectionalModel
 from models.model_2_price import PriceModel
 from models.model_3_exhaustion import ExhaustionModel
 from feature_engine.pipeline import build_features_1min, build_features_5min
-from correlation.cross_asset import inject_cross_asset_features
+from backtest.risk_manager import check_kill_switch, ExposureManager, CircuitBreaker
 from backtest.risk_manager import (
     check_kill_switch,
     calculate_atr,
@@ -56,23 +70,26 @@ from backtest.risk_manager import (
 # -------------------------------------------------------------------------
 # CONFIGURATION
 # -------------------------------------------------------------------------
-PARQUET_DIR = r"d:\CODE\rajasthani\DATA\parquet"
 ARTIFACTS_DIR = r"d:\CODE\rajasthani\trading_pipeline\artifacts"
-PEER_MAP_PATH = os.path.join(ARTIFACTS_DIR, "peer_map.json")
 MODEL_1_PATH = os.path.join(ARTIFACTS_DIR, "model_1_direction.json")
 MODEL_2_PATH = os.path.join(ARTIFACTS_DIR, "model_2_price.json")
 MODEL_3_PATH = os.path.join(ARTIFACTS_DIR, "model_3_exhaustion.json")
 SIGNALS_PATH = os.path.join(ARTIFACTS_DIR, "signals.csv")
 
+# Exhaustion threshold: Model 3 must predict at least this much drawdown
+# to be considered a "mean reversion" opportunity
+EXHAUSTION_THRESHOLD = -0.003  # -0.3% predicted drawdown
 # Threshold: Drawdown must exceed -0.3% (-0.003) for mean-reversion setup
 EXHAUSTION_THRESHOLD = -0.003
 
 
 def load_models() -> tuple:
     """
+    Loads all three pre-trained XGBoost models from their saved weight files.
     Loads all three pre-trained XGBoost models from disk.
     
     Returns:
+        (model_1, model_2, model_3): Tuple of loaded model instances.
         (model_1, model_2, model_3)
     """
     model_1 = DirectionalModel(MODEL_1_PATH)
@@ -85,6 +102,8 @@ def load_models() -> tuple:
     model_1.load(MODEL_1_PATH)
     model_2.load(MODEL_2_PATH)
     model_3.load(MODEL_3_PATH)
+    
+    print("All 3 models loaded successfully.")
     return model_1, model_2, model_3
 
 
@@ -93,14 +112,23 @@ def generate_signals(
     symbol: str,
     model_1: DirectionalModel,
     model_2: PriceModel,
+    model_3: ExhaustionModel
     model_3: ExhaustionModel,
     portfolio_capital: float = 100000.0,
     risk_pct_per_trade: float = 0.02
 ) -> pd.DataFrame:
     """
+    Runs all three models on the input data and combines their predictions
+    into actionable trading signals.
     Runs 3-model inference with full risk management (position sizing, exposure caps).
     
     Args:
+        df_raw: Raw 1-minute OHLCV DataFrame for a single stock.
+        symbol: Stock ticker name.
+        model_1: Loaded directional classifier.
+        model_2: Loaded price predictor.
+        model_3: Loaded exhaustion detector.
+    
         df_raw: Raw 1-min OHLCV DataFrame.
         symbol: Stock ticker symbol.
         model_1: Loaded DirectionalModel.
@@ -110,29 +138,56 @@ def generate_signals(
         risk_pct_per_trade: Percentage risk per trade (default 2%).
         
     Returns:
+        DataFrame with columns: [date, symbol, direction, confidence,
+        predicted_price_move, predicted_drawdown, entry_price, signal_type]
         DataFrame of actionable signals with ATR-sized position allocations.
     """
+    # --- Engineer Features ---
     # 1. Engineer features
     df_1min = build_features_1min(df_raw)
     df_5min = build_features_5min(df_raw)
-    df_5min = inject_cross_asset_features(df_5min, symbol, PEER_MAP_PATH, PARQUET_DIR)
     
+    # Get the feature columns that each model expects
+    # (drop non-feature columns like date, symbol, raw OHLCV)
     drop_cols = ['date', 'symbol', 'open', 'high', 'low', 'close', 'volume',
                  'mid_price', 'future_close_5m', 'target']
     feature_cols_5m = [c for c in df_5min.columns if c not in drop_cols]
     feature_cols_1m = [c for c in df_1min.columns if c not in drop_cols]
     
+    feature_cols_5min = [c for c in df_5min.columns if c not in drop_cols]
+    feature_cols_1min = [c for c in df_1min.columns if c not in drop_cols]
     X_5min = df_5min[feature_cols_5m].dropna()
     X_1min = df_1min[feature_cols_1m].dropna()
     
+    X_5min = df_5min[feature_cols_5min].dropna()
+    X_1min = df_1min[feature_cols_1min].dropna()
+    
     if len(X_5min) == 0 or len(X_1min) == 0:
+        print(f"  WARNING: Not enough clean data for {symbol}")
         return pd.DataFrame()
+    
+    # --- Run Models ---
+    # Model 1: Direction (Up = 1, Down = 0)
+    pred_direction = model_1.predict(X_5min)
+    if isinstance(pred_direction, tuple):
+        pred_classes, pred_proba = pred_direction
+    else:
+        pred_classes = pred_direction
+        pred_proba = np.ones(len(pred_classes)) * 0.5
+    
+    # Model 2: Exact price movement (percentage)
+    pred_price_move = model_2.predict(X_5min)
+    
+    # Model 3: Predicted drawdown (negative percentage)
         
     # 2. Model Predictions
     pred_dir, prob_dir = model_1.predict(X_5min)
     pred_price = model_2.predict(X_5min)
     pred_drawdown = model_3.predict(X_1min)
     
+    # --- Combine Signals ---
+    # Align lengths to the shortest prediction set
+    min_len = min(len(pred_classes), len(pred_price_move), len(pred_drawdown))
     # 3. Risk Managers
     exposure_mgr = ExposureManager(max_correlated_positions=2, correlation_threshold=0.7)
     atr_series = calculate_atr(df_5min, period=14)
@@ -141,26 +196,46 @@ def generate_signals(
     signals = []
     
     for i in range(min_len):
+        direction = int(pred_classes[i])           # 1 = UP, 0 = DOWN
+        confidence = float(pred_proba[i]) if i < len(pred_proba) else 0.5
+        price_move = float(pred_price_move[i])
         direction = int(pred_dir[i])
         confidence = float(prob_dir[i])
         price_move = float(pred_price[i])
         drawdown = float(pred_drawdown[i])
         
+        # Current mid-price (from the 5-minute data)
         current_price = float(df_5min['mid_price'].iloc[i]) if 'mid_price' in df_5min.columns else float(df_5min['close'].iloc[i])
+        current_date = df_5min['date'].iloc[i] if 'date' in df_5min.columns else None
         current_date = df_5min.index[i] if isinstance(df_5min.index, pd.DatetimeIndex) else df_5min['date'].iloc[i]
         
+        signal_type = "HOLD"  # Default: do nothing
         signal_type = "HOLD"
         entry_price = current_price
         
+        # =====================================================================
+        # THE COMBINATION RULE (from Section 5 of the spec):
+        # If Model 1 says UP and Model 3 detects exhaustion (sharp drop incoming),
+        # this is a MEAN REVERSION buy opportunity — buy the dip!
+        # =====================================================================
         # COMBINATION LOGIC:
         # If Model 1 says UP and Model 3 predicts sharp drop (drawdown < threshold)
         if direction == 1 and drawdown < EXHAUSTION_THRESHOLD:
+            # Mean reversion setup detected!
+            # Calculate limit order entry below current price
+            entry_price = current_price * (1 + drawdown)  # drawdown is negative
             # Entry Price Formula: Current Mid-Price * (1 - abs(Predicted_Drop))
             entry_price = current_price * (1.0 - abs(drawdown))
             signal_type = "MEAN_REVERSION_BUY"
+        
+        elif direction == 1 and confidence > 0.6:
+            # Strong bullish signal without exhaustion
         elif direction == 1 and confidence > 0.60:
             signal_type = "MOMENTUM_BUY"
             entry_price = current_price
+        
+        elif direction == 0 and confidence > 0.6:
+            # Strong bearish signal
         elif direction == 0 and confidence > 0.60:
             signal_type = "MOMENTUM_SELL"
             entry_price = current_price
@@ -196,48 +271,85 @@ def generate_signals(
             'predicted_price_move': round(price_move, 6),
             'predicted_drawdown': round(drawdown, 6),
             'entry_price': round(entry_price, 2),
+            'signal_type': signal_type,
+            'current_price': round(current_price, 2)
             'current_price': round(current_price, 2),
             'atr_14': round(current_atr, 4),
             'shares': int(shares),
             'position_value': position_value,
             'signal_type': signal_type
         })
+    
         
     return pd.DataFrame(signals)
 
 
 def run_inference(df_raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     """
+    Full inference pipeline: load models, check risk controls, generate signals.
+    
+    This is the main entry point for running predictions on new data.
+    
+    Args:
+        df_raw: Raw 1-minute OHLCV DataFrame.
+        symbol: Stock ticker.
+    
+    Returns:
+        DataFrame of trading signals (or empty if kill switch is on).
     Main inference entrypoint. Halts on kill switch, loads models, outputs signals.
     """
+    # --- Safety Checks ---
     # 1. Kill Switch Check (Regulatory Requirement)
     if check_kill_switch():
         print(f"KILL SWITCH ACTIVE. Suppressing all signals for {symbol}.")
         return pd.DataFrame()
+    
+    # --- Load Models ---
         
     # 2. Load Models
     model_1, model_2, model_3 = load_models()
     
+    # --- Generate Signals ---
     # 3. Generate Signals
     signals = generate_signals(df_raw, symbol, model_1, model_2, model_3)
     
     if len(signals) > 0:
+        # Filter out HOLD signals (no action)
+        actionable = signals[signals['signal_type'] != 'HOLD']
+        
+        # Save all signals to CSV
         actionable = signals[signals['signal_type'].isin(['MEAN_REVERSION_BUY', 'MOMENTUM_BUY', 'MOMENTUM_SELL'])]
         os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+        
         if os.path.exists(SIGNALS_PATH):
             existing = pd.read_csv(SIGNALS_PATH)
             combined = pd.concat([existing, actionable], ignore_index=True)
         else:
             combined = actionable
+        
         combined.to_csv(SIGNALS_PATH, index=False)
         print(f"Generated {len(actionable)} actionable signals for {symbol}.")
         
+        print(f"\nSignal Summary for {symbol}:")
+        print(f"  Total bars analyzed: {len(signals)}")
+        print(f"  Actionable signals: {len(actionable)}")
+        if len(actionable) > 0:
+            print(f"  Signal types: {actionable['signal_type'].value_counts().to_dict()}")
+        print(f"  Signals saved to: {SIGNALS_PATH}")
+    
     return signals
 
 
 if __name__ == "__main__":
+    # Example: Run inference on a single stock from Parquet
     import polars as pl
+    
     test_file = os.path.join(r"d:\CODE\rajasthani\DATA\parquet", "RELIANCE.parquet")
+    
+    if not os.path.exists(test_file):
+        print("ERROR: Run preprocess_to_parquet.py and train_master.py first!")
+    else:
+        df = pl.read_parquet(test_file).to_pandas()
     if os.path.exists(test_file):
         df = pl.read_parquet(test_file, memory_map=False).to_pandas()
         signals = run_inference(df, "RELIANCE")
