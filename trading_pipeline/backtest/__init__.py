@@ -1,9 +1,9 @@
 # Backtest module
 from .engine import BacktestEngine, TransactionCostModel
 from .risk_manager import (
-    check_kill_switch,
+    CircuitBreaker,
+    ExposureManager,
     calculate_atr,
     calculate_position_size,
-    ExposureManager,
-    CircuitBreaker
+    check_kill_switch,
 )

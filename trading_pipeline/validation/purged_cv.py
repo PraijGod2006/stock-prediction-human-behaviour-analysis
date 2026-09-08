@@ -28,10 +28,10 @@ models in fewer iterations.
 ========================================================================================
 """
 
+
 import numpy as np
-import pandas as pd
-from typing import Optional, Callable
 import optuna
+import pandas as pd
 
 # Silence Optuna's verbose trial logging
 optuna.logging.set_verbosity(optuna.logging.WARNING)

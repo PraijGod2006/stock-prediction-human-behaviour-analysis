@@ -1,5 +1,6 @@
 import pandas as pd
 
+
 class Aggregator:
     """
     Handles aggregation and resampling of financial time series data.

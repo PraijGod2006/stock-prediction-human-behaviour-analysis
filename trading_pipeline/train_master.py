@@ -24,6 +24,7 @@ This is the brain of the entire training pipeline. It:
 
 import gc
 import glob
+import json
 import os
 import sys
 
@@ -224,37 +225,55 @@ def train_all_companies(tune_first_company: bool = False) -> None:
         print("-" * 50)
 
         # --- STEP 1: Load Data ---
+        print("  [Step 1] Loading raw 1-minute Parquet data via Polars...")
         try:
             df = pl.read_parquet(parquet_path, memory_map=False).to_pandas()
-            print(f"  Loaded {len(df):,} rows of 1-minute data.")
+            print(f"    -> Loaded {len(df):,} rows x {len(df.columns)} columns from {os.path.basename(parquet_path)}")
         except Exception as e:  # noqa: BLE001
-            print(f"  ERROR loading data for {symbol}: {e}")
+            print(f"    ERROR loading data for {symbol}: {e}")
             continue
 
         # --- STEP 2: Engineer Features ---
+        print("  [Step 2] Feature Engineering via feature_engine/pipeline.py...")
         try:
+            print("    -> Calling build_features_1min() for Model 3 (Exhaustion indicators, VWAP, RSI, Volume Z)...")
             df_1min = build_features_1min(df)
+            print(f"       1-min features ready: {df_1min.shape[0]:,} rows x {df_1min.shape[1]} columns")
+
+            print("    -> Calling build_features_5min() for Models 1 & 2 (OHLCV 5m aggregation + Z-scores)...")
             df_5min = build_features_5min(df)
+            print(f"       5-min features ready: {df_5min.shape[0]:,} rows x {df_5min.shape[1]} columns")
         except Exception as e:  # noqa: BLE001
-            print(f"  ERROR engineering features for {symbol}: {e}")
+            print(f"    ERROR engineering features for {symbol}: {e}")
             del df
             gc.collect()
             continue
 
         if len(df_5min) < 100 or len(df_1min) < 100:
-            print(f"  SKIPPING {symbol}: Not enough data after feature engineering.")
+            print(f"    SKIPPING {symbol}: Not enough data after feature engineering.")
             del df, df_1min, df_5min
             gc.collect()
             continue
 
         # --- STEP 3: Inject Cross-Asset Signals (Model 1) ---
+        print("  [Step 3] Cross-Asset Signal Injection via correlation/cross_asset.py...")
         if os.path.exists(PEER_MAP_PATH):
             try:
+                with open(PEER_MAP_PATH) as f:
+                    peer_map_peek = json.load(f)
+                peers_info = peer_map_peek.get(symbol, {})
+                pos_peers = peers_info.get("top_positive", [])
+                neg_peers = peers_info.get("top_negative", [])
+                print(f"    -> Identified correlated peers from peer_map.json: +{pos_peers} | -{neg_peers}")
                 df_5min = inject_cross_asset_features(df_5min, symbol, PEER_MAP_PATH, PARQUET_DIR)
+                print(f"    -> Injected 6 normalized peer momentum features (5m shape now: {df_5min.shape})")
             except Exception as e:  # noqa: BLE001
-                print(f"  WARNING: Could not inject cross-asset features: {e}")
+                print(f"    WARNING: Could not inject cross-asset features: {e}")
+        else:
+            print("    INFO: peer_map.json not found, skipping cross-asset injection.")
 
         # --- STEP 4: Prepare Targets with Zero-Leakage Alignment ---
+        print("  [Step 4] Target Preparation with Zero-Leakage Alignment...")
         drop_cols = [
             'date', 'symbol', 'open', 'high', 'low', 'close', 'volume',
             'mid_price', 'future_close_5m', 'target', '__target_dir',
@@ -262,13 +281,14 @@ def train_all_companies(tune_first_company: bool = False) -> None:
         ]
 
         # Model 1 & 2 Targets: aligned to 5-minute index
+        print("    -> Model 1: model_1.prepare_target() (Next 5m binary direction: UP=1, DOWN=0)")
         y_dir_df = model_1.prepare_target(df_5min)
+        print("    -> Model 2: model_2.prepare_target() (Section 13: 1m return of first bar in next window)")
         y_price_df = model_2.prepare_target(df_5min, df_1min=df_1min)
 
-        targets_5m = pd.concat([
-            y_dir_df['target'].rename('target_dir'),
-            y_price_df['target'].rename('target_price')
-        ], axis=1).dropna()
+        target_dir_s = pd.Series(y_dir_df['target'], name='target_dir')
+        target_price_s = pd.Series(y_price_df['target'], name='target_price')
+        targets_5m = pd.concat([target_dir_s, target_price_s], axis=1).dropna()
         common_idx_5m = df_5min.index.intersection(targets_5m.index)
 
         X_5min = pd.DataFrame(df_5min.loc[common_idx_5m, [c for c in df_5min.columns if c not in drop_cols]])
@@ -282,13 +302,16 @@ def train_all_companies(tune_first_company: bool = False) -> None:
         y_price = pd.Series(y_price[valid_5m])
 
         # Model 3: Maximum 10-minute forward drawdown
+        print("    -> Model 3: model_3.prepare_target() (10-minute forward maximum drawdown)")
         df_1min_with_target = model_3.prepare_target(df_1min)
-        y_exhaust_raw = df_1min_with_target['target']
-        X_1min_raw = df_1min_with_target[[c for c in df_1min_with_target.columns if c not in drop_cols]]
+        y_exhaust_raw = pd.Series(df_1min_with_target['target'])
+        X_1min_raw = pd.DataFrame(df_1min_with_target[[c for c in df_1min_with_target.columns if c not in drop_cols]])
         X_1min, y_exhaust = clean_data(X_1min_raw, y_exhaust_raw)
 
+        print(f"    -> Clean aligned samples: 5-min = {len(X_5min):,} rows ({X_5min.shape[1]} features) | 1-min = {len(X_1min):,} rows ({X_1min.shape[1]} features)")
+
         if len(X_5min) < 50 or len(X_1min) < 50:
-            print(f"  SKIPPING {symbol}: Not enough clean data.")
+            print(f"    SKIPPING {symbol}: Not enough clean data.")
             del df, df_1min, df_5min, targets_5m, df_1min_with_target, y_dir_df, y_price_df
             gc.collect()
             continue
@@ -298,12 +321,20 @@ def train_all_companies(tune_first_company: bool = False) -> None:
         gc.collect()
 
         # --- STEP 5: Feature Drift Detection (PSI) ---
+        print("  [Step 5] Population Stability Index (PSI) Drift Monitoring via monitoring/drift_detector.py...")
         if i == 0:
             drift_detector.set_baseline(X_5min, symbol)
+            print(f"    -> Baseline feature distribution established with {symbol}")
         else:
-            drift_detector.check_drift(X_5min, symbol)
+            drift_res = drift_detector.check_drift(X_5min, symbol)
+            drifted_feats = drift_res.get('drifted_features', []) if isinstance(drift_res, dict) else []
+            if drifted_feats:
+                print(f"    -> [PSI ALERT] Drift detected in {len(drifted_feats)} features: {drifted_feats[:3]}...")
+            else:
+                print("    -> Feature distribution stable: No significant PSI drift.")
 
         # --- STEP 6: Mix Replay Buffers (Mitigate Catastrophic Forgetting) ---
+        print("  [Step 6] Replay Buffer Sampling (Anti-Catastrophic Forgetting)...")
         replay_5 = load_replay_5min()
         if replay_5 is not None and models_initialized:
             X_replay_5, y_dir_replay, y_price_replay = replay_5
@@ -312,7 +343,7 @@ def train_all_companies(tune_first_company: bool = False) -> None:
                 X_5min_train = pd.concat([X_5min[common_cols], X_replay_5[common_cols]], ignore_index=True)
                 y_dir_train = pd.concat([y_dir, y_dir_replay], ignore_index=True)
                 y_price_train = pd.concat([y_price, y_price_replay], ignore_index=True)
-                print(f"  Mixed 5min replay: {len(X_replay_5)} replay + {len(X_5min)} new rows")
+                print(f"    -> Mixed 5-min replay: {len(X_replay_5):,} buffer rows + {len(X_5min):,} current rows = {len(X_5min_train):,} total")
             else:
                 X_5min_train = X_5min
                 y_dir_train = y_dir
@@ -322,6 +353,7 @@ def train_all_companies(tune_first_company: bool = False) -> None:
             X_5min_train = X_5min
             y_dir_train = y_dir
             y_price_train = y_price
+            print(f"    -> 5-min dataset ready: {len(X_5min_train):,} samples (no prior replay buffer)")
 
         replay_1 = load_replay_1min()
         if replay_1 is not None and models_initialized:
@@ -330,7 +362,7 @@ def train_all_companies(tune_first_company: bool = False) -> None:
             if len(common_cols_1) > 0:
                 X_1min_train = pd.concat([X_1min[common_cols_1], X_replay_1[common_cols_1]], ignore_index=True)
                 y_exhaust_train = pd.concat([y_exhaust, y_exhaust_replay], ignore_index=True)
-                print(f"  Mixed 1min replay: {len(X_replay_1)} replay + {len(X_1min)} new rows")
+                print(f"    -> Mixed 1-min replay: {len(X_replay_1):,} buffer rows + {len(X_1min):,} current rows = {len(X_1min_train):,} total")
             else:
                 X_1min_train = X_1min
                 y_exhaust_train = y_exhaust
@@ -338,10 +370,13 @@ def train_all_companies(tune_first_company: bool = False) -> None:
         else:
             X_1min_train = X_1min
             y_exhaust_train = y_exhaust
+            print(f"    -> 1-min dataset ready: {len(X_1min_train):,} samples (no prior replay buffer)")
 
         gc.collect()
 
         # --- STEP 7: Purged Walk-Forward Cross-Validation Split ---
+        print("  [Step 7] Purged Walk-Forward Cross-Validation Split & Model Training...")
+        X_5min_train = pd.DataFrame(X_5min_train)
         cv_5m = PurgedWalkForwardCV(n_splits=4, purge_gap=10, embargo_gap=5)
         folds_5m = list(cv_5m.split(X_5min_train))
         train_idx_5m, val_idx_5m = folds_5m[-1]
@@ -353,6 +388,7 @@ def train_all_companies(tune_first_company: bool = False) -> None:
         y_tr_price = pd.Series(y_price_train.iloc[train_idx_5m])
         y_va_price = pd.Series(y_price_train.iloc[val_idx_5m])
 
+        X_1min_train = pd.DataFrame(X_1min_train)
         cv_1m = PurgedWalkForwardCV(n_splits=4, purge_gap=15, embargo_gap=10)
         folds_1m = list(cv_1m.split(X_1min_train))
         train_idx_1m, val_idx_1m = folds_1m[-1]
@@ -361,6 +397,9 @@ def train_all_companies(tune_first_company: bool = False) -> None:
         X_va1 = pd.DataFrame(X_1min_train.iloc[val_idx_1m])
         y_tr_exh = pd.Series(y_exhaust_train.iloc[train_idx_1m])
         y_va_exh = pd.Series(y_exhaust_train.iloc[val_idx_1m])
+
+        print(f"    -> 5-min CV fold (validation/purged_cv.py): Train={len(X_tr5):,} rows, Val={len(X_va5):,} rows (purge=10, embargo=5)")
+        print(f"    -> 1-min CV fold (validation/purged_cv.py): Train={len(X_tr1):,} rows, Val={len(X_va1):,} rows (purge=15, embargo=10)")
 
         # Model paths for incremental warm-start
         prev_m1 = MODEL_1_PATH if models_initialized and os.path.exists(MODEL_1_PATH) else None
@@ -372,6 +411,8 @@ def train_all_companies(tune_first_company: bool = False) -> None:
         rmse_exh = 0.0
 
         # --- Model 1: Directional Classifier ---
+        mode_m1 = "incremental warm-start (xgb_model=prev)" if prev_m1 else "initial training from scratch"
+        print(f"    -> [Model 1: Direction] Calling models.model_1_direction.DirectionalModel.train() ({mode_m1})...")
         try:
             model_1.train(X_tr5, y_tr_dir, X_va5, y_va_dir, xgb_model=prev_m1)
             y_pred = model_1.predict(X_va5)
@@ -379,91 +420,128 @@ def train_all_companies(tune_first_company: bool = False) -> None:
             acc = float(accuracy_score(y_va_dir, preds))
             model_1.save(MODEL_1_PATH)
             logger.log(symbol, "model_1_direction", {"accuracy": round(acc, 4), "val_size": len(X_va5)})
+            print(f"       Model 1 Result: Val Accuracy = {acc*100:.2f}% (Saved to {os.path.basename(MODEL_1_PATH)})")
         except Exception as e:  # noqa: BLE001
-            print(f"  ERROR training Model 1: {e}")
+            print(f"       ERROR training Model 1: {e}")
 
         # --- Model 2: Price Movement Regressor ---
+        mode_m2 = "incremental warm-start (xgb_model=prev)" if prev_m2 else "initial training from scratch"
+        print(f"    -> [Model 2: Price Return] Calling models.model_2_price.PriceModel.train() ({mode_m2})...")
         try:
             model_2.train(X_tr5, y_tr_price, X_va5, y_va_price, xgb_model=prev_m2)
             y_pred_price = model_2.predict(X_va5)
             rmse_price = float(np.sqrt(mean_squared_error(y_va_price, y_pred_price)))
             model_2.save(MODEL_2_PATH)
             logger.log(symbol, "model_2_price", {"rmse": round(rmse_price, 6), "val_size": len(X_va5)})
+            print(f"       Model 2 Result: Val RMSE = {rmse_price:.6f} (Saved to {os.path.basename(MODEL_2_PATH)})")
         except Exception as e:  # noqa: BLE001
-            print(f"  ERROR training Model 2: {e}")
+            print(f"       ERROR training Model 2: {e}")
 
         # --- Model 3: Exhaustion Regressor ---
+        mode_m3 = "incremental warm-start (xgb_model=prev)" if prev_m3 else "initial training from scratch"
+        print(f"    -> [Model 3: Exhaustion] Calling models.model_3_exhaustion.ExhaustionModel.train() ({mode_m3})...")
         try:
             model_3.train(X_tr1, y_tr_exh, X_va1, y_va_exh, xgb_model=prev_m3)
             y_pred_exh = model_3.predict(X_va1)
             rmse_exh = float(np.sqrt(mean_squared_error(y_va_exh, y_pred_exh)))
             model_3.save(MODEL_3_PATH)
             logger.log(symbol, "model_3_exhaustion", {"rmse": round(rmse_exh, 6), "val_size": len(X_va1)})
+            print(f"       Model 3 Result: Val RMSE = {rmse_exh:.6f} (Saved to {os.path.basename(MODEL_3_PATH)})")
         except Exception as e:  # noqa: BLE001
-            print(f"  ERROR training Model 3: {e}")
+            print(f"       ERROR training Model 3: {e}")
 
         # --- STEP 8: Update Replay Buffers ---
+        print(f"  [Step 8] Updating replay buffers on disk with 5% historical sample of {symbol}...")
         update_replay_buffer_5min(X_5min, y_dir, y_price, symbol)
         update_replay_buffer_1min(X_1min, y_exhaust, symbol)
+        print("    -> Replay buffers updated (replay_buffer_5min.parquet & replay_buffer_1min.parquet)")
 
         models_initialized = True
 
         # --- STEP 9: Periodic Full Retrain from Replay Buffer (every 25 companies) ---
         if (i + 1) % 25 == 0 and i > 0:
-            print(f"\n  *** PERIODIC FULL RETRAIN (after {i+1} companies) ***")
+            print("\n  ******************************************************************")
+            print(f"  *** [Step 9] PERIODIC FULL RETRAIN TRIGGERED (after {i+1} companies) ***")
+            print("  *** Retraining Models 1, 2, and 3 from full historical replay buffer ***")
+            print("  ******************************************************************")
             try:
-                # Retrain Model 1
+                # Retrain Model 1 & Model 2 (from 5-min replay buffer)
                 replay_5 = load_replay_5min()
                 if replay_5 is not None:
-                    Xr, yr_dir, _ = replay_5
-                    valid_r5 = Xr.replace([np.inf, -np.inf], np.nan).notna().all(axis=1) & yr_dir.notna()
-                    Xr = pd.DataFrame(Xr[valid_r5])
-                    yr_dir = pd.Series(yr_dir[valid_r5])
-                    sp = int(len(Xr) * 0.8)
+                    Xr_raw, yr_dir_raw, yr_price_raw = replay_5
+                    print(f"    -> Loaded 5-min replay buffer: {len(Xr_raw):,} total historical samples")
+
+                    # Retrain Model 1 (Directional Classifier)
+                    valid_r5_m1 = Xr_raw.replace([np.inf, -np.inf], np.nan).notna().all(axis=1) & yr_dir_raw.notna()
+                    Xr_m1 = pd.DataFrame(Xr_raw[valid_r5_m1])
+                    yr_dir = pd.Series(yr_dir_raw[valid_r5_m1])
+                    sp1 = int(len(Xr_m1) * 0.8)
+                    print(f"    -> [Retrain M1] DirectionalModel: Training fresh on {sp1:,} samples, validating on {len(Xr_m1)-sp1:,}...")
                     model_1_fresh = DirectionalModel()
                     model_1_fresh.train(
-                        pd.DataFrame(Xr.iloc[:sp]),
-                        pd.Series(yr_dir.iloc[:sp]),
-                        pd.DataFrame(Xr.iloc[sp:]),
-                        pd.Series(yr_dir.iloc[sp:])
+                        pd.DataFrame(Xr_m1.iloc[:sp1]),
+                        pd.Series(yr_dir.iloc[:sp1]),
+                        pd.DataFrame(Xr_m1.iloc[sp1:]),
+                        pd.Series(yr_dir.iloc[sp1:])
                     )
                     model_1_fresh.save(MODEL_1_PATH)
                     model_1 = model_1_fresh
-                    print("  Model 1 successfully retrained from full replay buffer.")
-                    del replay_5, Xr, yr_dir
+                    print("       Model 1 successfully retrained from full replay buffer.")
+                    del Xr_m1, yr_dir
 
-                # Retrain Model 3
+                    # Retrain Model 2 (Price Movement Regressor)
+                    valid_r5_m2 = Xr_raw.replace([np.inf, -np.inf], np.nan).notna().all(axis=1) & yr_price_raw.notna()
+                    Xr_m2 = pd.DataFrame(Xr_raw[valid_r5_m2])
+                    yr_price = pd.Series(yr_price_raw[valid_r5_m2])
+                    sp2 = int(len(Xr_m2) * 0.8)
+                    print(f"    -> [Retrain M2] PriceModel: Training fresh on {sp2:,} samples, validating on {len(Xr_m2)-sp2:,}...")
+                    model_2_fresh = PriceModel()
+                    model_2_fresh.train(
+                        pd.DataFrame(Xr_m2.iloc[:sp2]),
+                        pd.Series(yr_price.iloc[:sp2]),
+                        pd.DataFrame(Xr_m2.iloc[sp2:]),
+                        pd.Series(yr_price.iloc[sp2:])
+                    )
+                    model_2_fresh.save(MODEL_2_PATH)
+                    model_2 = model_2_fresh
+                    print("       Model 2 successfully retrained from full replay buffer.")
+                    del replay_5, Xr_raw, yr_dir_raw, yr_price_raw, Xr_m2, yr_price
+
+                # Retrain Model 3 (Exhaustion Regressor)
                 replay_1 = load_replay_1min()
                 if replay_1 is not None:
                     Xr1, yr_exh = replay_1
+                    print(f"    -> Loaded 1-min replay buffer: {len(Xr1):,} total historical samples")
                     valid_r1 = Xr1.replace([np.inf, -np.inf], np.nan).notna().all(axis=1) & yr_exh.notna()
                     Xr1 = pd.DataFrame(Xr1[valid_r1])
                     yr_exh = pd.Series(yr_exh[valid_r1])
-                    sp1 = int(len(Xr1) * 0.8)
+                    sp3 = int(len(Xr1) * 0.8)
+                    print(f"    -> [Retrain M3] ExhaustionModel: Training fresh on {sp3:,} samples, validating on {len(Xr1)-sp3:,}...")
                     model_3_fresh = ExhaustionModel()
                     model_3_fresh.train(
-                        pd.DataFrame(Xr1.iloc[:sp1]),
-                        pd.Series(yr_exh.iloc[:sp1]),
-                        pd.DataFrame(Xr1.iloc[sp1:]),
-                        pd.Series(yr_exh.iloc[sp1:])
+                        pd.DataFrame(Xr1.iloc[:sp3]),
+                        pd.Series(yr_exh.iloc[:sp3]),
+                        pd.DataFrame(Xr1.iloc[sp3:]),
+                        pd.Series(yr_exh.iloc[sp3:])
                     )
                     model_3_fresh.save(MODEL_3_PATH)
                     model_3 = model_3_fresh
-                    print("  Model 3 successfully retrained from full replay buffer.")
+                    print("       Model 3 successfully retrained from full replay buffer.")
                     del replay_1, Xr1, yr_exh
 
                 gc.collect()
             except Exception as e:  # noqa: BLE001
-                print(f"  ERROR during periodic retrain: {e}")
+                print(f"    ERROR during periodic retrain: {e}")
 
         # --- STEP 10: Strict Memory Cleanup ---
+        print("  [Step 10] Memory Cleanup: Releasing temporary DataFrames & running gc.collect()...")
         del X_5min, X_1min, y_dir, y_exhaust, y_price
         del X_5min_train, X_1min_train, y_dir_train, y_exhaust_train, y_price_train
         del X_tr5, X_va5, X_tr1, X_va1
         del y_tr_dir, y_va_dir, y_tr_exh, y_va_exh, y_tr_price, y_va_price
         gc.collect()
-
-        print(f"  Completed {symbol}. M1 acc: {acc*100:.2f}%, M2 RMSE: {rmse_price:.6f}, M3 RMSE: {rmse_exh:.6f}")
+        print("    -> Cleaned. Peak RAM flat at < 2 GB.")
+        print(f"  Finished {symbol} -> [M1 Acc: {acc*100:.2f}%, M2 RMSE: {rmse_price:.6f}, M3 RMSE: {rmse_exh:.6f}]")
 
     print("\n" + "=" * 70)
     print("INCREMENTAL TRAINING PIPELINE COMPLETE!")

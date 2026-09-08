@@ -20,10 +20,10 @@ WHY VALIDATION?
 ========================================================================================
 """
 
-import os
 import glob
+import os
+
 import polars as pl
-from datetime import timedelta
 
 # -------------------------------------------------------------------------
 # CONFIGURATION
@@ -33,8 +33,7 @@ OUTPUT_DIR = r"d:\CODE\rajasthani\DATA\parquet"
 ERROR_LOG = os.path.join(OUTPUT_DIR, "validation_errors.csv")
 
 
-import pandera as pa
-from pandera import Column, Check, DataFrameSchema
+from pandera import Check, Column, DataFrameSchema
 
 # Formal Pandera schema specification for financial OHLCV bars
 OHLCV_SCHEMA = DataFrameSchema(
@@ -186,7 +185,7 @@ def convert_all_csvs():
         print(f"\nValidation errors logged to: {ERROR_LOG}")
         print(f"Total error rows: {len(error_log)}")
     
-    print(f"\n--- Preprocessing Complete ---")
+    print("\n--- Preprocessing Complete ---")
     print(f"Total rows processed: {total_rows:,}")
     print(f"Total clean rows: {total_clean:,}")
     print(f"Total dropped rows: {total_bad:,}")

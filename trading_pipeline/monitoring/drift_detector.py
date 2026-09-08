@@ -23,12 +23,12 @@ We also support the Kolmogorov-Smirnov (KS) test as an alternative.
 ========================================================================================
 """
 
-import numpy as np
-import pandas as pd
 import json
 import os
 from datetime import datetime
-from typing import Optional
+
+import numpy as np
+import pandas as pd
 
 
 def calculate_psi(expected: np.ndarray, actual: np.ndarray, n_bins: int = 10) -> float:

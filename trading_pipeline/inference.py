@@ -147,14 +147,20 @@ def generate_signals(
         entry_price = current_price
         
         # COMBINATION LOGIC:
+        # confidence is P(UP). For DOWN direction (0), P(DOWN) is (1.0 - confidence).
+        p_up = confidence
+        p_down = 1.0 - confidence
+
         if direction == 1 and drawdown < EXHAUSTION_THRESHOLD:
             # Mean reversion setup: Buy the dip at predicted forward drop
             entry_price = current_price * (1.0 - abs(drawdown))
             signal_type = "MEAN_REVERSION_BUY"
-        elif direction == 1 and confidence > 0.60:
+        elif direction == 1 and p_up >= 0.52 and price_move > 0:
+            # Momentum Buy: Strong upward probability confirmed by Model 2 expected positive drift
             signal_type = "MOMENTUM_BUY"
             entry_price = current_price
-        elif direction == 0 and confidence > 0.60:
+        elif direction == 0 and p_down >= 0.52 and price_move < 0:
+            # Momentum Sell: Strong downward probability confirmed by Model 2 expected negative drift
             signal_type = "MOMENTUM_SELL"
             entry_price = current_price
             

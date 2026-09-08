@@ -25,10 +25,9 @@ METRICS REPORTED:
 ========================================================================================
 """
 
+
 import numpy as np
 import pandas as pd
-from typing import Optional
-from datetime import datetime
 
 
 class TransactionCostModel:

@@ -19,7 +19,6 @@ WHAT IT LOGS:
 import json
 import os
 from datetime import datetime
-from typing import Optional
 
 
 class MetricsLogger:
@@ -58,9 +57,9 @@ class MetricsLogger:
         symbol: str,
         model_id: str,
         metrics: dict,
-        feature_importances: Optional[dict] = None,
-        psi_scores: Optional[dict] = None,
-        fold_number: Optional[int] = None,
+        feature_importances: dict | None = None,
+        psi_scores: dict | None = None,
+        fold_number: int | None = None,
         retrain_triggered: bool = False,
         notes: str = ""
     ):
@@ -102,7 +101,7 @@ class MetricsLogger:
         metric_str = ", ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" for k, v in metrics.items())
         print(f"  [LOG] {symbol} | {model_id} | {metric_str}")
     
-    def load_metrics(self, model_id: Optional[str] = None, symbol: Optional[str] = None) -> list:
+    def load_metrics(self, model_id: str | None = None, symbol: str | None = None) -> list:
         """
         Loads and optionally filters the logged metrics.
         
@@ -122,7 +121,7 @@ class MetricsLogger:
         
         return results
     
-    def get_latest(self, model_id: str) -> Optional[dict]:
+    def get_latest(self, model_id: str) -> dict | None:
         """Returns the most recent log entry for a given model."""
         filtered = self.load_metrics(model_id=model_id)
         return filtered[-1] if filtered else None

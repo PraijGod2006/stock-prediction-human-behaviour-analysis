@@ -23,10 +23,9 @@ To ensure 100% zero lookahead bias:
 ========================================================================================
 """
 
+
 import numpy as np
 import pandas as pd
-import numpy as np
-from typing import Optional
 
 
 class ZScoreCalculator:
@@ -39,7 +38,7 @@ class ZScoreCalculator:
     """
     
 
-    def _get_session_groups(self, index: pd.DatetimeIndex) -> pd.Series:
+    def _get_session_groups(self, index: pd.Index) -> pd.Series:
         """
         Detects session boundaries by finding gaps > 4 hours in the index.
         Returns a group ID series used for groupby operations.
@@ -89,10 +88,9 @@ class ZScoreCalculator:
         
         # Calculate Z-score
         zscore = (series - rolling_mean) / rolling_std
+        # Zero std (e.g. constant series like flat volume) maps to 0.0 z-score
+        zscore = zscore.where(rolling_std != 0, 0.0)
         return zscore
-        mean = series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=1).mean().shift(1))
-        std = series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std(ddof=1).shift(1))
-        return (series - mean) / std.replace(0, np.nan)
 
     # -------------------------------------------------------------------------
     # Formula 2: Rolling Z-Score (Population Standard Deviation, ddof=0)
@@ -134,10 +132,8 @@ class ZScoreCalculator:
         )
         
         zscore = (series - rolling_mean) / rolling_std
+        zscore = zscore.where(rolling_std != 0, 0.0)
         return zscore
-        mean = series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=1).mean().shift(1))
-        std = series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std(ddof=0).shift(1))
-        return (series - mean) / std.replace(0, np.nan)
 
     # -------------------------------------------------------------------------
     # Formula 3: Simple Return Z-Score

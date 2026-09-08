@@ -1,5 +1,7 @@
+from typing import Any
+
 import pandas as pd
-import numpy as np
+
 
 class TechnicalIndicators:
     """
@@ -7,7 +9,7 @@ class TechnicalIndicators:
     All methods reset their statistics at session boundaries (> 4 hour gaps).
     """
 
-    def _get_session_groups(self, index: pd.DatetimeIndex) -> pd.Series:
+    def _get_session_groups(self, index: pd.Index) -> pd.Series:
         """
         Detects session boundaries by finding gaps > 4 hours in the index.
         Returns a group ID series used for groupby operations.
@@ -74,19 +76,18 @@ class TechnicalIndicators:
         """
         groups = self._get_session_groups(df.index)
         
-        def _calc_vwap(group_df: pd.DataFrame) -> pd.Series:
-            # Shift price and volume by 1 to prevent lookahead bias
-            shifted_price = group_df[price_col].shift(1)
-            shifted_volume = group_df[volume_col].shift(1)
-            
-            # Calculate cumulative sums
-            cum_vol_price = (shifted_price * shifted_volume).cumsum()
-            cum_vol = shifted_volume.cumsum()
-            
-            # Compute VWAP
-            return cum_vol_price / cum_vol
-            
-        return df.groupby(groups, group_keys=False).apply(_calc_vwap)
+        # Shift price and volume by 1 to prevent lookahead bias
+        shifted_price = df[price_col].shift(1)
+        shifted_volume = df[volume_col].shift(1)
+        
+        # Vectorized cumulative product and cumulative volume per session group
+        cum_vol_price = (shifted_price * shifted_volume).groupby(groups).cumsum()
+        cum_vol = shifted_volume.groupby(groups).cumsum()
+        
+        # Compute VWAP. If volume is zero (e.g. index data), fall back to shifted_price
+        vwap_series = cum_vol_price / cum_vol
+        vwap_series = vwap_series.fillna(shifted_price)
+        return pd.Series(vwap_series, index=df.index, name='vwap')
 
     def distance_from_vwap(self, df: pd.DataFrame) -> pd.Series:
         """
@@ -105,9 +106,9 @@ class TechnicalIndicators:
         # Calculate distance
         # We use current mid_price vs shifted VWAP calculation
         distance = (df['mid_price'] - current_vwap) / current_vwap
-        return distance
+        return pd.Series(distance.fillna(0.0), index=df.index, name='distance_from_vwap')
 
-    def exhaustion_features(self, df: pd.DataFrame, zscore_calc: object) -> pd.DataFrame:
+    def exhaustion_features(self, df: pd.DataFrame, zscore_calc: Any) -> pd.DataFrame:
         """
         Calculates exhaustion features for the dataframe.
         
@@ -125,7 +126,7 @@ class TechnicalIndicators:
         dist_vwap = self.distance_from_vwap(df)
         
         # 14-min RSI
-        rsi_14 = self.rsi(df['mid_price'], period=14)
+        rsi_14 = self.rsi(pd.Series(df['mid_price']), period=14)
         
         # Combine into DataFrame
         result = pd.DataFrame({

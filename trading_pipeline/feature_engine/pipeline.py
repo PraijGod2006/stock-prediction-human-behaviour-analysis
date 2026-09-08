@@ -8,11 +8,12 @@ All calculations use shift(1) to strictly eliminate data leakage.
 ========================================================================================
 """
 
-import pandas as pd
 import numpy as np
-from .zscore import ZScoreCalculator
-from .indicators import TechnicalIndicators
+import pandas as pd
+
 from .aggregator import Aggregator
+from .indicators import TechnicalIndicators
+from .zscore import ZScoreCalculator
 
 
 def build_features_1min(df: pd.DataFrame) -> pd.DataFrame:
