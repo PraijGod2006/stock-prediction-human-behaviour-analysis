@@ -43,7 +43,7 @@ from models.model_2_price import PriceModel
 from models.model_3_exhaustion import ExhaustionModel
 from monitoring.drift_detector import DriftDetector
 from monitoring.metrics_logger import MetricsLogger
-from validation.purged_cv import PurgedWalkForwardCV
+from validation.purged_cv import PurgedWalkForwardCV, optimize_hyperparameters
 
 # -------------------------------------------------------------------------
 # CONFIGURATION
@@ -56,6 +56,7 @@ PEER_MAP_PATH = os.path.join(ARTIFACTS_DIR, "peer_map.json")
 MODEL_1_PATH = os.path.join(ARTIFACTS_DIR, "model_1_direction.json")
 MODEL_2_PATH = os.path.join(ARTIFACTS_DIR, "model_2_price.json")
 MODEL_3_PATH = os.path.join(ARTIFACTS_DIR, "model_3_exhaustion.json")
+BEST_HYPERPARAMS_PATH = os.path.join(ARTIFACTS_DIR, "best_hyperparameters.json")
 
 # Replay buffer paths -- separate files for 5-min (Models 1&2) and 1-min (Model 3)
 REPLAY_5MIN_PATH = os.path.join(ARTIFACTS_DIR, "replay_buffer_5min.parquet")
@@ -190,12 +191,118 @@ def clean_data(X: pd.DataFrame, y: pd.Series) -> tuple[pd.DataFrame, pd.Series]:
     return pd.DataFrame(X_clean[valid]), pd.Series(y_clean[valid])
 
 
-def train_all_companies(tune_first_company: bool = False) -> None:
+def run_hyperparameter_tuning(first_parquet_path: str) -> None:
+    """
+    Fix Group D: Runs Optuna Bayesian hyperparameter tuning on the first company's data
+    across all purged CV folds, and persists the best parameters to artifacts/best_hyperparameters.json.
+    """
+    symbol = os.path.basename(first_parquet_path).replace(".parquet", "")
+    print("\n" + "=" * 70)
+    print(f"OPTUNA HYPERPARAMETER TUNING REQUESTED (tuning on: {symbol})")
+    print("=" * 70)
+
+    try:
+        df_raw = pl.read_parquet(first_parquet_path, memory_map=False).to_pandas()
+        df_1min = build_features_1min(df_raw)
+        df_5min = build_features_5min(df_raw)
+
+        if os.path.exists(PEER_MAP_PATH):
+            try:
+                df_5min = inject_cross_asset_features(df_5min, symbol, PEER_MAP_PATH, PARQUET_DIR)
+            except Exception:
+                pass
+
+        m1_tmp = DirectionalModel()
+        m2_tmp = PriceModel()
+        m3_tmp = ExhaustionModel()
+
+        y_dir_df = m1_tmp.prepare_target(df_5min)
+        y_price_df = m2_tmp.prepare_target(df_5min, df_1min=df_1min)
+
+        target_dir_s = pd.Series(y_dir_df['target'], name='target_dir')
+        target_price_s = pd.Series(y_price_df['target'], name='target_price')
+        targets_5m = pd.concat([target_dir_s, target_price_s], axis=1).dropna()
+        common_idx_5m = df_5min.index.intersection(targets_5m.index)
+
+        drop_cols = [
+            'date', 'symbol', 'open', 'high', 'low', 'close', 'volume',
+            'mid_price', 'future_close_5m', 'target', '__target_dir',
+            '__target_price', '__target_exhaust', '__symbol'
+        ]
+        X_5min = pd.DataFrame(df_5min.loc[common_idx_5m, [c for c in df_5min.columns if c not in drop_cols]])
+        y_dir = pd.Series(targets_5m.loc[common_idx_5m, 'target_dir'])
+        y_price = pd.Series(targets_5m.loc[common_idx_5m, 'target_price'])
+
+        valid_5m = (
+            X_5min.replace([np.inf, -np.inf], np.nan).notna().all(axis=1)
+            & y_dir.replace([np.inf, -np.inf], np.nan).notna()
+            & y_price.replace([np.inf, -np.inf], np.nan).notna()
+        )
+        X_5min = pd.DataFrame(X_5min[valid_5m])
+        y_dir = pd.Series(y_dir[valid_5m])
+        y_price = pd.Series(y_price[valid_5m])
+
+        df_1min_target = m3_tmp.prepare_target(df_1min)
+        y_exhaust_raw = pd.Series(df_1min_target['target'])
+        X_1min_raw = pd.DataFrame(df_1min_target[[c for c in df_1min_target.columns if c not in drop_cols]])
+        X_1min, y_exhaust = clean_data(X_1min_raw, y_exhaust_raw)
+
+        print(f"  [Optuna Tuning] Samples: 5m={len(X_5min):,} rows, 1m={len(X_1min):,} rows")
+
+        print("  -> Running Optuna trials for Model 1 (Directional Classifier)...")
+        best_m1 = optimize_hyperparameters(
+            X_5min, y_dir, DirectionalModel, n_trials=30, n_splits=4,
+            purge_gap=10, embargo_gap=5, is_classifier=True
+        )
+
+        print("  -> Running Optuna trials for Model 2 (Price Movement Regressor)...")
+        best_m2 = optimize_hyperparameters(
+            X_5min, y_price, PriceModel, n_trials=30, n_splits=4,
+            purge_gap=10, embargo_gap=5, is_classifier=False
+        )
+
+        print("  -> Running Optuna trials for Model 3 (Exhaustion Regressor)...")
+        best_m3 = optimize_hyperparameters(
+            X_1min, y_exhaust, ExhaustionModel, n_trials=30, n_splits=4,
+            purge_gap=15, embargo_gap=10, is_classifier=False
+        )
+
+        all_best = {
+            "model_1_direction": best_m1,
+            "model_2_price": best_m2,
+            "model_3_exhaustion": best_m3
+        }
+
+        os.makedirs(os.path.dirname(BEST_HYPERPARAMS_PATH), exist_ok=True)
+        with open(BEST_HYPERPARAMS_PATH, 'w') as f:
+            json.dump(all_best, f, indent=4)
+
+        print(f"  [Optuna Tuning] Complete! Best hyperparameters saved to: {BEST_HYPERPARAMS_PATH}")
+        print("=" * 70 + "\n")
+        del df_raw, df_1min, df_5min, X_5min, y_dir, y_price, X_1min, y_exhaust
+        gc.collect()
+    except Exception as e:
+        print(f"  ERROR during Optuna hyperparameter tuning: {e}")
+
+
+def train_all_companies(tune_hyperparams: bool = False) -> None:
     """
     Main training loop across all companies.
     Iterates through each Parquet file one by one (memory-safe incremental learning).
     """
     ensure_artifacts_dir()
+
+    # Find all Parquet files
+    parquet_files = sorted(glob.glob(os.path.join(PARQUET_DIR, "*.parquet")))
+
+    if not parquet_files:
+        print(f"ERROR: No Parquet files found in {PARQUET_DIR}")
+        print("Run preprocess_to_parquet.py first!")
+        return
+
+    # Fix Group D: If hyperparameter tuning requested, run Optuna on first company before main loop
+    if tune_hyperparams and len(parquet_files) > 0:
+        run_hyperparameter_tuning(parquet_files[0])
 
     # Initialize models (will load existing weights if files exist)
     model_1 = DirectionalModel(MODEL_1_PATH)
@@ -205,14 +312,6 @@ def train_all_companies(tune_first_company: bool = False) -> None:
     # Initialize monitoring
     logger = MetricsLogger(os.path.join(ARTIFACTS_DIR, "training_log.json"))
     drift_detector = DriftDetector(os.path.join(ARTIFACTS_DIR, "drift_log.json"))
-
-    # Find all Parquet files
-    parquet_files = sorted(glob.glob(os.path.join(PARQUET_DIR, "*.parquet")))
-
-    if not parquet_files:
-        print(f"ERROR: No Parquet files found in {PARQUET_DIR}")
-        print("Run preprocess_to_parquet.py first!")
-        return
 
     print(f"Found {len(parquet_files)} companies to train on.")
     print("=" * 70)
@@ -262,11 +361,15 @@ def train_all_companies(tune_first_company: bool = False) -> None:
                 with open(PEER_MAP_PATH) as f:
                     peer_map_peek = json.load(f)
                 peers_info = peer_map_peek.get(symbol, {})
-                pos_peers = peers_info.get("top_positive", [])
-                neg_peers = peers_info.get("top_negative", [])
+                if "correlated_peers_raw" in peers_info:
+                    pos_peers = peers_info.get("correlated_peers_raw", {}).get("top_positive", [])
+                    neg_peers = peers_info.get("correlated_peers_raw", {}).get("top_negative", [])
+                else:
+                    pos_peers = peers_info.get("top_positive", [])
+                    neg_peers = peers_info.get("top_negative", [])
                 print(f"    -> Identified correlated peers from peer_map.json: +{pos_peers} | -{neg_peers}")
                 df_5min = inject_cross_asset_features(df_5min, symbol, PEER_MAP_PATH, PARQUET_DIR)
-                print(f"    -> Injected 6 normalized peer momentum features (5m shape now: {df_5min.shape})")
+                print(f"    -> Injected 18 normalized peer momentum features across 3 dimensions (5m shape now: {df_5min.shape})")
             except Exception as e:  # noqa: BLE001
                 print(f"    WARNING: Could not inject cross-asset features: {e}")
         else:
@@ -415,12 +518,24 @@ def train_all_companies(tune_first_company: bool = False) -> None:
         print(f"    -> [Model 1: Direction] Calling models.model_1_direction.DirectionalModel.train() ({mode_m1})...")
         try:
             model_1.train(X_tr5, y_tr_dir, X_va5, y_va_dir, xgb_model=prev_m1)
-            y_pred = model_1.predict(X_va5)
-            preds = y_pred[0] if isinstance(y_pred, tuple) else y_pred
-            acc = float(accuracy_score(y_va_dir, preds))
+            # Fix Group A.2: Evaluate across ALL walk-forward CV folds for honest out-of-fold validation
+            fold_accs = []
+            for f_idx, (_, f_val_idx) in enumerate(folds_5m):
+                f_X_va = pd.DataFrame(X_5min_train.iloc[f_val_idx])
+                f_y_va = pd.Series(y_dir_train.iloc[f_val_idx])
+                f_yp = model_1.predict(f_X_va)
+                f_preds = f_yp[0] if isinstance(f_yp, tuple) else f_yp
+                fold_accs.append(float(accuracy_score(f_y_va, f_preds)))
+            acc = float(np.mean(fold_accs))
             model_1.save(MODEL_1_PATH)
-            logger.log(symbol, "model_1_direction", {"accuracy": round(acc, 4), "val_size": len(X_va5)})
-            print(f"       Model 1 Result: Val Accuracy = {acc*100:.2f}% (Saved to {os.path.basename(MODEL_1_PATH)})")
+            logger.log(symbol, "model_1_direction", {
+                "accuracy": round(acc, 4),
+                "last_fold_accuracy": round(fold_accs[-1], 4),
+                "all_fold_accuracies": [round(a, 4) for a in fold_accs],
+                "n_folds": len(fold_accs),
+                "val_size": len(X_va5)
+            })
+            print(f"       Model 1 Result: Mean Val Accuracy (across {len(fold_accs)} folds) = {acc*100:.2f}% (Last fold: {fold_accs[-1]*100:.2f}%) (Saved to {os.path.basename(MODEL_1_PATH)})")
         except Exception as e:  # noqa: BLE001
             print(f"       ERROR training Model 1: {e}")
 
@@ -429,11 +544,23 @@ def train_all_companies(tune_first_company: bool = False) -> None:
         print(f"    -> [Model 2: Price Return] Calling models.model_2_price.PriceModel.train() ({mode_m2})...")
         try:
             model_2.train(X_tr5, y_tr_price, X_va5, y_va_price, xgb_model=prev_m2)
-            y_pred_price = model_2.predict(X_va5)
-            rmse_price = float(np.sqrt(mean_squared_error(y_va_price, y_pred_price)))
+            # Fix Group A.2: Evaluate across ALL walk-forward CV folds for honest out-of-fold validation
+            fold_rmses_price = []
+            for f_idx, (_, f_val_idx) in enumerate(folds_5m):
+                f_X_va = pd.DataFrame(X_5min_train.iloc[f_val_idx])
+                f_y_va = pd.Series(y_price_train.iloc[f_val_idx])
+                f_preds = model_2.predict(f_X_va)
+                fold_rmses_price.append(float(np.sqrt(mean_squared_error(f_y_va, f_preds))))
+            rmse_price = float(np.mean(fold_rmses_price))
             model_2.save(MODEL_2_PATH)
-            logger.log(symbol, "model_2_price", {"rmse": round(rmse_price, 6), "val_size": len(X_va5)})
-            print(f"       Model 2 Result: Val RMSE = {rmse_price:.6f} (Saved to {os.path.basename(MODEL_2_PATH)})")
+            logger.log(symbol, "model_2_price", {
+                "rmse": round(rmse_price, 6),
+                "last_fold_rmse": round(fold_rmses_price[-1], 6),
+                "all_fold_rmses": [round(r, 6) for r in fold_rmses_price],
+                "n_folds": len(fold_rmses_price),
+                "val_size": len(X_va5)
+            })
+            print(f"       Model 2 Result: Mean Val RMSE (across {len(fold_rmses_price)} folds) = {rmse_price:.6f} (Last fold: {fold_rmses_price[-1]:.6f}) (Saved to {os.path.basename(MODEL_2_PATH)})")
         except Exception as e:  # noqa: BLE001
             print(f"       ERROR training Model 2: {e}")
 
@@ -442,11 +569,23 @@ def train_all_companies(tune_first_company: bool = False) -> None:
         print(f"    -> [Model 3: Exhaustion] Calling models.model_3_exhaustion.ExhaustionModel.train() ({mode_m3})...")
         try:
             model_3.train(X_tr1, y_tr_exh, X_va1, y_va_exh, xgb_model=prev_m3)
-            y_pred_exh = model_3.predict(X_va1)
-            rmse_exh = float(np.sqrt(mean_squared_error(y_va_exh, y_pred_exh)))
+            # Fix Group A.2: Evaluate across ALL walk-forward CV folds for honest out-of-fold validation
+            fold_rmses_exh = []
+            for f_idx, (_, f_val_idx) in enumerate(folds_1m):
+                f_X_va = pd.DataFrame(X_1min_train.iloc[f_val_idx])
+                f_y_va = pd.Series(y_exhaust_train.iloc[f_val_idx])
+                f_preds = model_3.predict(f_X_va)
+                fold_rmses_exh.append(float(np.sqrt(mean_squared_error(f_y_va, f_preds))))
+            rmse_exh = float(np.mean(fold_rmses_exh))
             model_3.save(MODEL_3_PATH)
-            logger.log(symbol, "model_3_exhaustion", {"rmse": round(rmse_exh, 6), "val_size": len(X_va1)})
-            print(f"       Model 3 Result: Val RMSE = {rmse_exh:.6f} (Saved to {os.path.basename(MODEL_3_PATH)})")
+            logger.log(symbol, "model_3_exhaustion", {
+                "rmse": round(rmse_exh, 6),
+                "last_fold_rmse": round(fold_rmses_exh[-1], 6),
+                "all_fold_rmses": [round(r, 6) for r in fold_rmses_exh],
+                "n_folds": len(fold_rmses_exh),
+                "val_size": len(X_va1)
+            })
+            print(f"       Model 3 Result: Mean Val RMSE (across {len(fold_rmses_exh)} folds) = {rmse_exh:.6f} (Last fold: {fold_rmses_exh[-1]:.6f}) (Saved to {os.path.basename(MODEL_3_PATH)})")
         except Exception as e:  # noqa: BLE001
             print(f"       ERROR training Model 3: {e}")
 
@@ -552,4 +691,12 @@ def train_all_companies(tune_first_company: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    train_all_companies()
+    import argparse
+    parser = argparse.ArgumentParser(description="Master Training Orchestrator for NIFTY 50")
+    parser.add_argument(
+        "--tune-hyperparams",
+        action="store_true",
+        help="Run Optuna Bayesian hyperparameter tuning on first company before streaming incremental loop"
+    )
+    args = parser.parse_args()
+    train_all_companies(tune_hyperparams=args.tune_hyperparams)

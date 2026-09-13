@@ -1,5 +1,7 @@
 import pandas as pd
 
+from feature_engine.reference_price import compute_reference_price
+
 
 class Aggregator:
     """
@@ -40,8 +42,8 @@ class Aggregator:
         # Drop rows where all elements are NaN (periods with no trades)
         resampled_df = resampled_df.dropna(how='all')
         
-        # Compute mid_price
-        # Formula: (open + close) / 2
-        resampled_df['mid_price'] = (resampled_df['open'] + resampled_df['close']) / 2.0
+        # Compute mid_price using the single source of truth: Typical Price = (H+L+C)/3
+        # NOTE: No real bid/ask data exists in the raw OHLCV feed. See reference_price.py.
+        resampled_df['mid_price'] = compute_reference_price(resampled_df)
         
         return resampled_df

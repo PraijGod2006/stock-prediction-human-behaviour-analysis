@@ -64,9 +64,10 @@ class PurgedWalkForwardCV:
         The data is divided into (n_splits + 1) sequential chunks.
         For each fold i:
           - Train on chunks [0, ..., i]
-          - Purge the last `purge_gap` rows from training
-          - Skip `embargo_gap` rows after training ends
+          - Purge the last `purge_gap` rows from training before validation
           - Validate on chunk [i + 1]
+          - Embargo `embargo_gap` rows immediately after validation, preventing 
+            them from being used in future training sets
         
         Yields:
             (train_indices, val_indices): Arrays of integer indices for each fold.
@@ -74,6 +75,7 @@ class PurgedWalkForwardCV:
         n_samples = len(X)
         # Size of each chunk (the validation window)
         chunk_size = n_samples // (self.n_splits + 1)
+        embargo_set = set()
         
         for i in range(self.n_splits):
             # Training: everything from the start up to the end of chunk i
@@ -83,16 +85,21 @@ class PurgedWalkForwardCV:
             # These rows have forward-looking labels that overlap with validation
             purged_train_end = max(0, train_end - self.purge_gap)
             
-            # Validation: starts after the embargo gap following the original train_end
-            val_start = train_end + self.embargo_gap
+            # Validation: starts exactly at train_end
+            val_start = train_end
             val_end = min(n_samples, chunk_size * (i + 2))
             
             # Safety check: validation must have data
             if val_start >= val_end:
                 continue
             
-            train_idx = np.arange(0, purged_train_end)
+            # Exclude embargoed indices from training
+            train_idx = np.array([j for j in range(purged_train_end) if j not in embargo_set])
             val_idx = np.arange(val_start, val_end)
+            
+            # Add embargo gap after this fold's validation
+            embargo_end = min(n_samples, val_end + self.embargo_gap)
+            embargo_set.update(range(val_end, embargo_end))
             
             yield train_idx, val_idx
     

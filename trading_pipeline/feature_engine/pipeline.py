@@ -13,6 +13,7 @@ import pandas as pd
 
 from .aggregator import Aggregator
 from .indicators import TechnicalIndicators
+from .reference_price import compute_reference_price
 from .zscore import ZScoreCalculator
 
 
@@ -46,10 +47,9 @@ def build_features_1min(df: pd.DataFrame) -> pd.DataFrame:
         df['date'] = pd.to_datetime(df['date'])
         df = df.set_index('date')
     
-    # 1. Compute mid_price
-    # Mid-price captures the average of open and close, useful as a proxy for the true price
-    # 1. Mid-Price approximation: removes bid-ask bounce distortion
-    df['mid_price'] = (df['open'] + df['close']) / 2.0
+    # 1. Mid-Price: Typical Price = (H+L+C)/3 — single source of truth
+    # NOTE: No real bid/ask data exists. See feature_engine/reference_price.py.
+    df['mid_price'] = compute_reference_price(df)
     
     # Initialize calculators
     zscore_calc = ZScoreCalculator()

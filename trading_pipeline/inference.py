@@ -40,10 +40,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from backtest.risk_manager import (
     ExposureManager,
+    CircuitBreaker,
+    PortfolioState,
     calculate_atr,
     calculate_position_size,
     check_kill_switch,
 )
+from correlation.cross_asset import inject_cross_asset_features
 from feature_engine.pipeline import build_features_1min, build_features_5min
 from models.model_1_direction import DirectionalModel
 from models.model_2_price import PriceModel
@@ -53,6 +56,8 @@ from models.model_3_exhaustion import ExhaustionModel
 # CONFIGURATION
 # -------------------------------------------------------------------------
 ARTIFACTS_DIR = r"d:\CODE\rajasthani\trading_pipeline\artifacts"
+PARQUET_DIR = r"d:\CODE\rajasthani\DATA\parquet"
+PEER_MAP_PATH = os.path.join(ARTIFACTS_DIR, "peer_map.json")
 MODEL_1_PATH = os.path.join(ARTIFACTS_DIR, "model_1_direction.json")
 MODEL_2_PATH = os.path.join(ARTIFACTS_DIR, "model_2_price.json")
 MODEL_3_PATH = os.path.join(ARTIFACTS_DIR, "model_3_exhaustion.json")
@@ -86,6 +91,9 @@ def generate_signals(
     model_1: DirectionalModel,
     model_2: PriceModel,
     model_3: ExhaustionModel,
+    exposure_mgr: ExposureManager | None = None,
+    circuit_breaker: CircuitBreaker | None = None,
+    portfolio_state: PortfolioState | None = None,
     portfolio_capital: float = 100000.0,
     risk_pct_per_trade: float = 0.02
 ) -> pd.DataFrame:
@@ -98,15 +106,35 @@ def generate_signals(
         model_1: Loaded DirectionalModel.
         model_2: Loaded PriceModel.
         model_3: Loaded ExhaustionModel.
+        exposure_mgr: Optional ExposureManager instance.
+        circuit_breaker: Optional CircuitBreaker instance.
+        portfolio_state: Optional PortfolioState instance.
         portfolio_capital: Current account equity.
         risk_pct_per_trade: Percentage risk per trade (default 2%).
         
     Returns:
         DataFrame of actionable signals with ATR-sized position allocations.
     """
+    if portfolio_state is None:
+        portfolio_state = PortfolioState()
+        portfolio_state.load()
+    if exposure_mgr is None:
+        exposure_mgr = ExposureManager(max_correlated_positions=2, correlation_threshold=0.7, portfolio_state=portfolio_state)
+    if circuit_breaker is None:
+        circuit_breaker = CircuitBreaker(portfolio_state=portfolio_state)
+
+    if not circuit_breaker.can_trade():
+        return pd.DataFrame()
+
     # 1. Engineer features
     df_1min = build_features_1min(df_raw)
     df_5min = build_features_5min(df_raw)
+    
+    if os.path.exists(PEER_MAP_PATH):
+        try:
+            df_5min = inject_cross_asset_features(df_5min, symbol, PEER_MAP_PATH, PARQUET_DIR)
+        except Exception as e:
+            print(f"  WARNING: Could not inject cross-asset features: {e}")
     
     drop_cols = [
         'date', 'symbol', 'open', 'high', 'low', 'close', 'volume',
@@ -128,13 +156,21 @@ def generate_signals(
     pred_drawdown = model_3.predict(X_1min)
     
     # 3. Risk Managers
-    exposure_mgr = ExposureManager(max_correlated_positions=2, correlation_threshold=0.7)
     atr_series = calculate_atr(df_5min, period=14)
     
     min_len = min(len(pred_dir), len(pred_price), len(pred_drawdown))
     signals = []
     
     for i in range(min_len):
+        # Update bars held and close logic
+        to_close = []
+        for pos_symbol, pos_data in portfolio_state.open_positions.items():
+            pos_data['bars_held'] += 1
+            if pos_data['bars_held'] >= 5:
+                to_close.append(pos_symbol)
+        for c in to_close:
+            exposure_mgr.close_position(c)
+
         direction = int(pred_dir[i])
         confidence = float(prob_dir[i])
         price_move = float(pred_price[i])
@@ -181,6 +217,7 @@ def generate_signals(
                     max_position_pct=0.10
                 )
                 position_value = round(shares * entry_price, 2)
+                exposure_mgr.register_position(symbol, direction=1 if 'BUY' in signal_type else -1, entry_price=entry_price, timestamp=str(current_date))
             else:
                 signal_type = "BLOCKED_BY_EXPOSURE_CAP"
                 
@@ -221,8 +258,16 @@ def run_inference(df_raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     # 2. Load Models
     model_1, model_2, model_3 = load_models()
     
-    # 3. Generate Signals
-    signals = generate_signals(df_raw, symbol, model_1, model_2, model_3)
+    # 3. State Management
+    portfolio_state = PortfolioState()
+    portfolio_state.load()
+    exposure_mgr = ExposureManager(portfolio_state=portfolio_state)
+    circuit_breaker = CircuitBreaker(portfolio_state=portfolio_state)
+    
+    # 4. Generate Signals
+    signals = generate_signals(df_raw, symbol, model_1, model_2, model_3, exposure_mgr, circuit_breaker, portfolio_state)
+    
+    portfolio_state.save()
     
     if len(signals) > 0:
         actionable = signals[signals['signal_type'].isin(['MEAN_REVERSION_BUY', 'MOMENTUM_BUY', 'MOMENTUM_SELL'])]

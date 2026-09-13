@@ -145,6 +145,45 @@ def calculate_position_size(
     return max(0.0, shares)
 
 
+class PortfolioState:
+    """
+    Unified state persistence for ExposureManager and CircuitBreaker.
+    Both read from and write to a single artifacts/portfolio_state.json file
+    to prevent state drift between related concerns.
+    """
+    STATE_FILE = os.path.join(ARTIFACTS_DIR, "portfolio_state.json")
+    
+    def __init__(self):
+        self.open_positions = {}  # {symbol: {direction, entry_price, timestamp, bars_held}}
+        self.daily_pnl = 0.0
+        self.daily_date = None
+        self.starting_capital = 0.0
+    
+    def save(self):
+        state = {
+            "open_positions": self.open_positions,
+            "daily_pnl": self.daily_pnl,
+            "daily_date": str(self.daily_date) if self.daily_date else None,
+            "starting_capital": self.starting_capital
+        }
+        os.makedirs(os.path.dirname(self.STATE_FILE), exist_ok=True)
+        with open(self.STATE_FILE, 'w') as f:
+            json.dump(state, f, indent=2)
+    
+    def load(self):
+        if not os.path.exists(self.STATE_FILE):
+            return
+        try:
+            with open(self.STATE_FILE, 'r') as f:
+                state = json.load(f)
+            self.open_positions = state.get("open_positions", {})
+            self.daily_pnl = state.get("daily_pnl", 0.0)
+            self.daily_date = state.get("daily_date")
+            self.starting_capital = state.get("starting_capital", 0.0)
+        except (json.JSONDecodeError, KeyError):
+            pass  # Corrupted state file — start fresh
+
+
 class ExposureManager:
     """
     Prevents over-concentration in correlated positions.
@@ -157,7 +196,7 @@ class ExposureManager:
     positions belong to the same cluster of highly correlated stocks.
     """
     
-    def __init__(self, max_correlated_positions: int = 2, correlation_threshold: float = 0.7):
+    def __init__(self, max_correlated_positions: int = 2, correlation_threshold: float = 0.7, portfolio_state: Optional['PortfolioState'] = None):
         """
         Args:
             max_correlated_positions: Max number of positions allowed in the same
@@ -167,7 +206,12 @@ class ExposureManager:
         self.max_correlated_positions = max_correlated_positions
         self.correlation_threshold = correlation_threshold
         self.peer_map: dict = {}
-        self.open_positions: set = set()
+        
+        self.portfolio_state = portfolio_state
+        if self.portfolio_state is not None:
+            self.open_positions = self.portfolio_state.open_positions
+        else:
+            self.open_positions = {}
         
         # Load peer map if available
         if os.path.exists(PEER_MAP_FILE):
@@ -197,13 +241,19 @@ class ExposureManager:
         
         return True
     
-    def register_position(self, symbol: str):
+    def register_position(self, symbol: str, direction: int, entry_price: float, timestamp: str):
         """Records that a position has been opened in the given symbol."""
-        self.open_positions.add(symbol)
+        self.open_positions[symbol] = {
+            "direction": direction,
+            "entry_price": entry_price,
+            "timestamp": timestamp,
+            "bars_held": 0
+        }
     
     def close_position(self, symbol: str):
         """Records that a position has been closed."""
-        self.open_positions.discard(symbol)
+        if symbol in self.open_positions:
+            del self.open_positions[symbol]
 
 
 class CircuitBreaker:
@@ -215,16 +265,26 @@ class CircuitBreaker:
     into a crashing market, each trade losing more than the last.
     """
     
-    def __init__(self, max_daily_loss_pct: float = -0.02):
+    def __init__(self, max_daily_loss_pct: float = -0.02, portfolio_state: Optional['PortfolioState'] = None):
         """
         Args:
             max_daily_loss_pct: Maximum daily loss as fraction of capital (e.g., -0.02 = -2%).
         """
         self.max_daily_loss_pct = max_daily_loss_pct
-        self.daily_pnl = 0.0
-        self.starting_capital = 0.0
+        self.portfolio_state = portfolio_state
+        
+        if self.portfolio_state is not None:
+            self.daily_pnl = self.portfolio_state.daily_pnl
+            self.starting_capital = self.portfolio_state.starting_capital
+            self.current_date = self.portfolio_state.daily_date
+        else:
+            self.daily_pnl = 0.0
+            self.starting_capital = 0.0
+            self.current_date = None
+            
         self.is_tripped = False
-        self.current_date = None
+        if self.starting_capital > 0 and (self.daily_pnl / self.starting_capital) <= self.max_daily_loss_pct:
+            self.is_tripped = True
     
     def reset_day(self, capital: float, date):
         """Resets the circuit breaker at the start of a new trading day."""
@@ -232,6 +292,10 @@ class CircuitBreaker:
         self.starting_capital = capital
         self.is_tripped = False
         self.current_date = date
+        if self.portfolio_state is not None:
+            self.portfolio_state.daily_pnl = 0.0
+            self.portfolio_state.starting_capital = capital
+            self.portfolio_state.daily_date = date
     
     def record_trade(self, pnl: float) -> bool:
         """
@@ -244,7 +308,9 @@ class CircuitBreaker:
             True if trading can continue, False if circuit breaker has tripped.
         """
         self.daily_pnl += pnl
-        
+        if self.portfolio_state is not None:
+            self.portfolio_state.daily_pnl = self.daily_pnl
+            
         if self.starting_capital > 0:
             daily_return = self.daily_pnl / self.starting_capital
             

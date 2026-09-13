@@ -370,8 +370,11 @@ def run_inference_verbose(
     5. Quantitative Signal Combiner (Direction, Price Move, Drawdown)
     6. Risk Manager Enforcement (Kill Switch, ATR Sizing, Exposure Limits)
     """
+    t_min = df_raw["date"].min() if "date" in df_raw.columns else "N/A"
+    t_max = df_raw["date"].max() if "date" in df_raw.columns else "N/A"
     print(f"\n  {'=' * 75}")
     print(f"  [START INFERENCE] Analyzing Ticker: {symbol} | Raw Bars: {len(df_raw):,}")
+    print(f"  [DATA TIMELINE]   Start: {t_min}  -->  End: {t_max}")
     print(f"  {'=' * 75}")
     t_start = time.time()
 
@@ -615,6 +618,13 @@ def process_aux_data_1(
                 if std_df.empty:
                     continue
 
+                t_start = std_df["date"].min() if "date" in std_df.columns else "N/A"
+                t_end = std_df["date"].max() if "date" in std_df.columns else "N/A"
+                print("\n  +--------------------------------------------------------------------------------")
+                print(f"  | [EXACT FILE CHOSEN] : {csv_path}")
+                print(f"  | [DATA TIMELINE]     : Start: {t_start}  -->  End: {t_end} ({len(std_df):,} raw bars)")
+                print("  +--------------------------------------------------------------------------------")
+
                 signals = run_inference_verbose(
                     df_raw=std_df,
                     symbol=symbol,
@@ -691,6 +701,13 @@ def process_aux_data_2(
             if len(std_df) > 5000:
                 print(f"    Index has {len(std_df):,} bars. Evaluating latest 5,000 bars for inference.")
                 std_df = std_df.tail(5000).reset_index(drop=True)
+
+            t_start = std_df["date"].min() if "date" in std_df.columns else "N/A"
+            t_end = std_df["date"].max() if "date" in std_df.columns else "N/A"
+            print("  +--------------------------------------------------------------------------------")
+            print(f"  | [EXACT FILE CHOSEN] : {csv_path}")
+            print(f"  | [DATA TIMELINE]     : Start: {t_start}  -->  End: {t_end} ({len(std_df):,} raw bars)")
+            print("  +--------------------------------------------------------------------------------")
 
             signals = run_inference_verbose(
                 df_raw=std_df,
@@ -784,15 +801,33 @@ def evaluate_single_stock_metrics(
 
     # Data collection for aggregate metrics
     all_eval_rows = []
+    session_info: list[dict[str, object]] = []
 
     for day_label, active_dir, csv_path in matched_files:
-        print(f"\n  >>> Loading & Standardizing: {day_label} -> {os.path.basename(csv_path)}")
         raw_csv = pd.read_csv(csv_path)
         std_df = standardize_aux1_csv(raw_csv, symbol)
 
         if len(std_df) < 20:
-            print("      -> SKIP: Insufficient rows in CSV")
+            print(f"      -> SKIP: Insufficient rows in CSV ({csv_path})")
             continue
+
+        t_start = std_df["date"].min() if "date" in std_df.columns else "N/A"
+        t_end = std_df["date"].max() if "date" in std_df.columns else "N/A"
+        session_info.append({
+            "session": day_label,
+            "file": csv_path,
+            "filename": os.path.basename(csv_path),
+            "start": str(t_start),
+            "end": str(t_end),
+            "bars": len(std_df),
+        })
+
+        print("\n  +--------------------------------------------------------------------------------")
+        print(f"  | [EXACT FILE CHOSEN] : {csv_path}")
+        print(f"  | [SESSION IDENTIFIER]: {day_label} (Symbol: {symbol})")
+        print(f"  | [DATA TIMELINE]     : Start: {t_start}  -->  End: {t_end}")
+        print(f"  | [RAW BARS LOADED]   : {len(std_df):,} 1-minute OHLCV bars")
+        print("  +--------------------------------------------------------------------------------")
 
         # Feature engineering
         print(f"      -> Engineering 1-min & 5-min features for {symbol}...")
@@ -962,6 +997,20 @@ def evaluate_single_stock_metrics(
     print("\n" + "=" * 80)
     print(f"          INFERENCE ACCURACY & PERFORMANCE DASHBOARD: {symbol}")
     print("=" * 80)
+    if len(session_info) == 1:
+        print(f"  Exact File Chosen       : {session_info[0]['file']}")
+        print(f"  Data Timeline (Start)   : {session_info[0]['start']}")
+        print(f"  Data Timeline (End)     : {session_info[0]['end']}")
+        print(f"  Raw 1-Min Bars Loaded   : {session_info[0]['bars']:,}")
+    elif len(session_info) > 1:
+        print(f"  Files Evaluated ({len(session_info)} files across {len(matched_files)} session(s)):")
+        for s_item in session_info:
+            print(f"    * [{s_item['session']}] {s_item['file']}")
+            print(f"      Timeline: {s_item['start']}  -->  {s_item['end']} ({s_item['bars']:,} bars)")
+        valid_starts = [str(s["start"]) for s in session_info if s["start"] != "N/A"]
+        valid_ends = [str(s["end"]) for s in session_info if s["end"] != "N/A"]
+        if valid_starts and valid_ends:
+            print(f"  Overall Data Timeline   : Start: {min(valid_starts)}  -->  End: {max(valid_ends)}")
     print(f"  Sessions Analyzed       : {len(matched_files)} day(s)")
     print(f"  Total 5-min Bars        : {total_bars:,}")
     print(f"  Market Baseline (UP %)  : {baseline_majority:.2f}%")

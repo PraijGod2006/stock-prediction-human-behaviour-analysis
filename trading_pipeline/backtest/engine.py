@@ -26,6 +26,11 @@ METRICS REPORTED:
 """
 
 
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+from feature_engine.reference_price import compute_reference_price
+from backtest.risk_manager import CircuitBreaker
+
 import numpy as np
 import pandas as pd
 
@@ -150,6 +155,9 @@ class BacktestEngine:
         position = 0   # Current shares held
         entry_price = 0
         
+        circuit_breaker = CircuitBreaker()
+        current_day = None
+        
         # Normalize date column types before merging
         prices = prices.copy()
         signals = signals.copy()
@@ -161,39 +169,52 @@ class BacktestEngine:
         # Merge signals with prices on date
         merged = prices.merge(signals, on='date', how='left', suffixes=('', '_signal'))
         
+        if all(c in merged.columns for c in ['high', 'low', 'close']):
+            merged['ref_price'] = compute_reference_price(merged)
+        else:
+            merged['ref_price'] = merged['close']
+        
         for i in range(len(merged)):
             row = merged.iloc[i]
             
+            day_str = row['date'].date() if pd.notna(row['date']) else None
+            if current_day is None or day_str != current_day:
+                current_day = day_str
+                circuit_breaker.reset_day(capital, day_str)
+            
             # Check for signal
             if pd.notna(row.get('direction')):
-                direction = int(row['direction'])
-                target_entry = row.get('entry_price', row['close'])
-                
-                # Estimate fill probability
-                fill_prob = estimate_limit_fill_probability(
-                    target_entry, row['low'], row['high']
-                )
-                
-                # Random fill check (simulate market uncertainty)
-                if np.random.random() < fill_prob and position == 0:
-                    # Calculate position size
-                    trade_value = capital * self.position_size_pct
-                    shares = trade_value / target_entry
+                if not circuit_breaker.can_trade():
+                    pass # Skip if circuit breaker tripped
+                else:
+                    direction = int(row['direction'])
+                    target_entry = row.get('entry_price', row['ref_price'])
                     
-                    # Deduct transaction costs
-                    cost = self.cost_model.compute_cost(trade_value, is_sell=False)
-                    capital -= cost
+                    # Estimate fill probability
+                    fill_prob = estimate_limit_fill_probability(
+                        target_entry, row['low'], row['high']
+                    )
                     
-                    position = shares * direction
-                    entry_price = target_entry
-                    
-                    trades.append({
-                        'entry_date': row['date'],
-                        'entry_price': target_entry,
-                        'direction': direction,
-                        'shares': abs(shares),
-                        'entry_cost': cost
-                    })
+                    # Random fill check (simulate market uncertainty)
+                    if np.random.random() < fill_prob and position == 0:
+                        # Calculate position size
+                        trade_value = capital * self.position_size_pct
+                        shares = trade_value / target_entry
+                        
+                        # Deduct transaction costs
+                        cost = self.cost_model.compute_cost(trade_value, is_sell=False)
+                        capital -= cost
+                        
+                        position = shares * direction
+                        entry_price = target_entry
+                        
+                        trades.append({
+                            'entry_date': row['date'],
+                            'entry_price': target_entry,
+                            'direction': direction,
+                            'shares': abs(shares),
+                            'entry_cost': cost
+                        })
             
             # Exit logic: close position after 5 bars (simple time-based exit)
             if position != 0 and len(trades) > 0:
@@ -204,7 +225,7 @@ class BacktestEngine:
                     ) if trade['entry_date'] in merged['date'].values else 0
                     
                     if bars_held >= 5:
-                        exit_price = row['close']
+                        exit_price = row['ref_price']
                         pnl = (exit_price - entry_price) * position
                         exit_cost = self.cost_model.compute_cost(
                             abs(position) * exit_price, is_sell=True
@@ -216,6 +237,7 @@ class BacktestEngine:
                         trade['pnl'] = pnl - exit_cost - trade['entry_cost']
                         trade['exit_cost'] = exit_cost
                         
+                        circuit_breaker.record_trade(trade['pnl'])
                         position = 0
             
             equity_curve.append(capital)

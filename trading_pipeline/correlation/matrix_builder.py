@@ -65,10 +65,12 @@ class CorrelationMatrixBuilder:
                 .select([
                     pl.col("date").alias("timestamp"),
                     pl.col("open"),
+                    pl.col("high"),
+                    pl.col("low"),
                     pl.col("close")
                 ])
                 .with_columns(
-                    ((pl.col("open") + pl.col("close")) / 2.0).alias("mid_price")
+                    ((pl.col("high") + pl.col("low") + pl.col("close")) / 3.0).alias("mid_price")
                 )
                 .sort("timestamp")
                 .with_columns(
@@ -111,19 +113,28 @@ class CorrelationMatrixBuilder:
         spike_corr.to_parquet(os.path.join(self.artifacts_dir, "correlation_matrix_spike.parquet"))
         
         # Extract top 3 positive and top 3 negative peers for each symbol
+        def _extract_peers(corr_matrix, symbols):
+            peers = {}
+            for sym in symbols:
+                sym_corr = corr_matrix[sym].drop(sym)
+                peers[sym] = {
+                    "top_positive": sym_corr.nlargest(3).index.tolist(),
+                    "top_negative": sym_corr.nsmallest(3).index.tolist()
+                }
+            return peers
+
         symbols = raw_corr.columns.tolist()
+        raw_peers = _extract_peers(raw_corr, symbols)
+        binary_peers = _extract_peers(bin_corr, symbols)
+        spike_peers = _extract_peers(spike_corr, symbols)
+        
         peer_map: Dict[str, Dict[str, Any]] = {}
         
         for sym in symbols:
-            # Drop self correlation
-            sym_corr = raw_corr[sym].drop(sym)
-            
-            top_pos = sym_corr.nlargest(3).index.tolist()
-            top_neg = sym_corr.nsmallest(3).index.tolist()
-            
             peer_map[sym] = {
-                "top_positive": top_pos,
-                "top_negative": top_neg
+                "correlated_peers_raw": raw_peers[sym],
+                "correlated_peers_binary": binary_peers[sym],
+                "correlated_peers_spike": spike_peers[sym]
             }
             
         # Save peer map to JSON

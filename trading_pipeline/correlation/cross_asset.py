@@ -20,13 +20,11 @@ BUG FIX HISTORY:
 CRITICAL DESIGN (Normalized Peer Roles):
 To allow XGBoost incremental learning (xgb_model=) across all 100 companies, feature
 column names MUST remain identical across companies. Therefore, we name features by
-their rank-ordered peer relationship, NOT by the peer's actual ticker symbol:
-- peer_pos_1_return_lag1 (highest positively correlated peer)
-- peer_pos_2_return_lag1 (2nd highest positively correlated peer)
-- peer_pos_3_return_lag1 (3rd highest positively correlated peer)
-- peer_neg_1_return_lag1 (highest inversely correlated peer)
-- peer_neg_2_return_lag1 (2nd highest inversely correlated peer)
-- peer_neg_3_return_lag1 (3rd highest inversely correlated peer)
+their rank-ordered peer relationship, NOT by the peer's actual ticker symbol. We track 3 correlation dimensions (raw, binary, spike):
+- peer_pos_raw_1_return_lag1 (highest positively correlated raw peer)
+- peer_neg_raw_1_return_lag1 (highest inversely correlated raw peer)
+- peer_pos_binary_1_return_lag1 ...
+(etc for up to 3 ranks per dimension and direction)
 
 LEAKAGE PREVENTION:
 Peer return at time T = (peer_mid_{T-1} - peer_mid_{T-6}) / peer_mid_{T-6}
@@ -41,11 +39,15 @@ import pandas as pd
 import polars as pl
 from typing import Union, Optional
 
-# Canonical schema: every symbol gets exactly these 6 columns, in this order,
+# Canonical schema: every symbol gets exactly these 18 columns, in this order,
 # regardless of how many peers were actually available for it.
 DEFAULT_PEER_COLS = [
-    "peer_pos_1_return_lag1", "peer_pos_2_return_lag1", "peer_pos_3_return_lag1",
-    "peer_neg_1_return_lag1", "peer_neg_2_return_lag1", "peer_neg_3_return_lag1",
+    "peer_pos_raw_1_return_lag1", "peer_pos_raw_2_return_lag1", "peer_pos_raw_3_return_lag1",
+    "peer_neg_raw_1_return_lag1", "peer_neg_raw_2_return_lag1", "peer_neg_raw_3_return_lag1",
+    "peer_pos_binary_1_return_lag1", "peer_pos_binary_2_return_lag1", "peer_pos_binary_3_return_lag1",
+    "peer_neg_binary_1_return_lag1", "peer_neg_binary_2_return_lag1", "peer_neg_binary_3_return_lag1",
+    "peer_pos_spike_1_return_lag1", "peer_pos_spike_2_return_lag1", "peer_pos_spike_3_return_lag1",
+    "peer_neg_spike_1_return_lag1", "peer_neg_spike_2_return_lag1", "peer_neg_spike_3_return_lag1",
 ]
 
 
@@ -64,7 +66,7 @@ def _load_peer_return(peer: str, parquet_dir: str) -> Optional[pd.Series]:
     try:
         peer_raw = pl.read_parquet(
             peer_file,
-            columns=["date", "open", "close"],
+            columns=["date", "high", "low", "close"],
             memory_map=False,
         ).to_pandas()
 
@@ -72,7 +74,7 @@ def _load_peer_return(peer: str, parquet_dir: str) -> Optional[pd.Series]:
             peer_raw['date'] = pd.to_datetime(peer_raw['date'])
             peer_raw = peer_raw.set_index('date')
 
-        peer_mid = (peer_raw['open'] + peer_raw['close']) / 2.0
+        peer_mid = (peer_raw['high'] + peer_raw['low'] + peer_raw['close']) / 3.0
 
         # 5-bar return, additionally shifted by 1 to prevent lookahead leakage:
         # feature at T = return realized from T-6 to T-1.
@@ -107,7 +109,7 @@ def inject_cross_asset_features(
         parquet_dir: Directory containing per-company Parquet files.
 
     Returns:
-        Pandas DataFrame enriched with the 6 peer_pos_*/peer_neg_* columns.
+        Pandas DataFrame enriched with the 18 peer_pos_*/peer_neg_* columns.
     """
     # --- Convert to Pandas if Polars ---
     if isinstance(df, pl.DataFrame):
@@ -132,28 +134,42 @@ def inject_cross_asset_features(
             df[col] = 0.0
         return df
 
-    peers_pos = peer_map[symbol].get("top_positive", [])[:3]
-    peers_neg = peer_map[symbol].get("top_negative", [])[:3]
+    sym_data = peer_map[symbol]
+    if 'correlated_peers_raw' in sym_data:
+        # New schema
+        dimensions = {
+            'raw': sym_data['correlated_peers_raw'],
+            'binary': sym_data['correlated_peers_binary'],
+            'spike': sym_data['correlated_peers_spike'],
+        }
+    else:
+        # Old schema fallback
+        dimensions = {
+            'raw': {'top_positive': sym_data.get('top_positive', []), 'top_negative': sym_data.get('top_negative', [])},
+            'binary': {'top_positive': [], 'top_negative': []},
+            'spike': {'top_positive': [], 'top_negative': []},
+        }
 
-    # --- Positive peers: peer_pos_1..3_return_lag1 ---
-    for rank, peer in enumerate(peers_pos):
-        col_name = f"peer_pos_{rank + 1}_return_lag1"
-        peer_return = _load_peer_return(peer, parquet_dir)
-        if peer_return is None:
-            df[col_name] = 0.0
-        else:
-            df = df.join(peer_return.rename(col_name), how='left')
+    for dim_name, dim_data in dimensions.items():
+        # --- Positive peers ---
+        for rank, peer in enumerate(dim_data.get('top_positive', [])[:3]):
+            col_name = f"peer_pos_{dim_name}_{rank+1}_return_lag1"
+            peer_return = _load_peer_return(peer, parquet_dir)
+            if peer_return is None:
+                df[col_name] = 0.0
+            else:
+                df = df.join(peer_return.rename(col_name), how='left')
 
-    # --- Negative (inversely correlated) peers: peer_neg_1..3_return_lag1 ---
-    for rank, peer in enumerate(peers_neg):
-        col_name = f"peer_neg_{rank + 1}_return_lag1"
-        peer_return = _load_peer_return(peer, parquet_dir)
-        if peer_return is None:
-            df[col_name] = 0.0
-        else:
-            df = df.join(peer_return.rename(col_name), how='left')
+        # --- Negative (inversely correlated) peers ---
+        for rank, peer in enumerate(dim_data.get('top_negative', [])[:3]):
+            col_name = f"peer_neg_{dim_name}_{rank+1}_return_lag1"
+            peer_return = _load_peer_return(peer, parquet_dir)
+            if peer_return is None:
+                df[col_name] = 0.0
+            else:
+                df = df.join(peer_return.rename(col_name), how='left')
 
-    # --- Guarantee all 6 standard columns exist, fill NaNs with 0.0 ---
+    # --- Guarantee all standard columns exist, fill NaNs with 0.0 ---
     # (Missing timestamps or fewer than 3 peers in a direction => "no signal".)
     for col in DEFAULT_PEER_COLS:
         if col not in df.columns:
