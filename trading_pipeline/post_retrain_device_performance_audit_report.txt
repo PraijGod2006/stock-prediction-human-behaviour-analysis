@@ -1,0 +1,303 @@
+================================================================================
+POST-RETRAIN DEVICE & PERFORMANCE AUDIT REPORT
+Codebase Inspection: Device Execution Mapping, GPU Verification, and Profiling
+Target Pipeline: XGBoost Nifty 50 Multi-Model Trading Pipeline
+Audited Date: 2026-09-14
+System Platform: Windows (NVIDIA GeForce RTX 3050 Laptop GPU, 4096 MiB VRAM)
+Target Directory: d:\CODE\rajasthani\trading_pipeline
+================================================================================
+
+[METADATA]
+AUDIT_TYPE: Performance & Hardware Execution Inspection
+SCOPE: Zero code modification; non-invasive telemetry and profiling only
+ENVIRONMENT: Python 3.12 (d:\CODE\rajasthani\shitimon\Scripts\python.exe)
+XGBOOST_VERSION_BUILD: 3.4.1 (CUDA 13.3, Thrust 3.3.3, USE_CUDA=True, USE_OPENMP=True)
+BENCHMARK_TICKER: RELIANCE (972,466 1-minute historical OHLCV bars)
+
+--------------------------------------------------------------------------------
+PART 1 -- DEVICE EXECUTION MAP (ALL 10 PIPELINE STAGES)
+--------------------------------------------------------------------------------
+
+STAGE 01: CSV -> Parquet Preprocessing
+  File: preprocess_to_parquet.py
+  Library: Polars (pl.read_csv, pl.DataFrame.write_parquet) + Pandera
+  GPU Capable Library: Polars (via optional RAPIDS/cuDF plugin); Pandera (CPU only)
+  Configured for GPU Right Now: NO (Runs on multi-threaded CPU)
+  Execution Details: Reads raw CSVs via standard Polars CPU multi-threading, validates schemas with Pandera on CPU, and writes snappy/zstd compressed Parquet files to disk.
+
+STAGE 02: Parquet Data Ingestion into Memory
+  File: train_master.py (line 230)
+  Library: Polars (pl.read_parquet) -> Pandas (to_pandas)
+  GPU Capable Library: NO (Polars standard engine is CPU only)
+  Configured for GPU Right Now: NO (Runs on CPU)
+  Execution Details: Loads Parquet data into memory via Polars and immediately converts to Pandas DataFrame in host RAM: pl.read_parquet(parquet_path, memory_map=False).to_pandas().
+
+STAGE 03: 5-Minute OHLC Resampling
+  File: feature_engine/aggregator.py (line 38)
+  Library: Pandas (pd.DataFrame.resample)
+  GPU Capable Library: cuDF supports GPU resampling; standard Pandas is CPU only
+  Configured for GPU Right Now: NO (Runs single-threaded on CPU)
+  Execution Details: Resamples 1-minute bars using df.resample('5min', label='left', closed='left').agg({'open':'first', 'high':'max', 'low':'min', 'close':'last', 'volume':'sum'}). Runs on 1 CPU core. Computes Typical Price via compute_reference_price().
+
+STAGE 04: 14 Rolling Z-Score Transformations
+  File: feature_engine/zscore.py (lines 66-410)
+  Library: Pandas (pd.Series.groupby, pd.Series.rolling, pd.Series.ewm, pd.Series.transform)
+  GPU Capable Library: cuDF supports GPU rolling windows; standard Pandas is CPU only
+  Configured for GPU Right Now: NO (Runs single-threaded on CPU)
+  Execution Details: All 14 Z-score variations execute via series.groupby(groups).transform(lambda x: x.rolling(...)). Runs sequentially through Python lambdas across intraday session groups on 1 CPU core.
+
+STAGE 05: VWAP, RSI, and Exhaustion Indicators
+  File: feature_engine/indicators.py (lines 30-138)
+  Library: Pandas (pd.Series.groupby, pd.Series.apply, pd.Series.ewm, pd.Series.cumsum)
+  GPU Capable Library: cuDF supports GPU ewm/cumsum; standard Pandas is CPU only
+  Configured for GPU Right Now: NO (Runs single-threaded on CPU)
+  Execution Details: RSI uses groupby(groups).apply(_calc_rsi) with Wilder's exponential smoothing (.ewm()). VWAP computes cumulative volume-price products via groupby(groups).cumsum(). Runs sequentially on 1 CPU core.
+
+STAGE 06: Cross-Asset Peer Signal Injection
+  File: correlation/cross_asset.py (lines 79-180)
+  Library: Polars (pl.read_parquet) -> Pandas (DataFrame.join, shift)
+  GPU Capable Library: Standard Polars/Pandas are CPU only
+  Configured for GPU Right Now: NO (Runs on CPU)
+  Execution Details: Dispatches reads for up to 18 peer series (raw, binary, and spike correlations) across positive and negative correlation groups from parquet, computes 5-minute lagged returns with shift(1), and joins onto the target symbol DataFrame by timestamp.
+
+STAGE 07: Purged Walk-Forward Cross-Validation Split Generation
+  File: validation/purged_cv.py (lines 80-120)
+  Library: NumPy + Python standard library integer indexing
+  GPU Capable Library: Standard Python integer arithmetic
+  Configured for GPU Right Now: NO (Runs on CPU)
+  Execution Details: Computes expanding training windows, purges the trailing window (purge_gap bars), sets validation window start strictly at train_end (Fix A.1), and filters subsequent training sets against the accumulated embargo_set. Takes < 0.05 seconds.
+
+STAGE 08: Replay Buffer Load & In-Memory Concatenation
+  File: train_master.py (lines 441-477)
+  Library: Polars (pl.read_parquet) -> Pandas (pd.concat)
+  GPU Capable Library: Standard Polars/Pandas are CPU only
+  Configured for GPU Right Now: NO (Runs on CPU)
+  Execution Details: Loads historical replay samples from disk (5% stratified samples of all previous companies) and performs pd.concat with current company feature matrices before CV splitting.
+
+STAGE 09: Model 1, Model 2, Model 3 Training (.fit() calls)
+  Files: models/model_1_direction.py, models/model_2_price.py, models/model_3_exhaustion.py
+  Library: XGBoost (xgb.XGBClassifier, xgb.XGBRegressor)
+  GPU Capable Library: YES (NVIDIA CUDA via tree_method='hist', device='cuda')
+  Configured for GPU Right Now: YES (100% GPU accelerated on CUDA)
+  Execution Details: Parameters {'tree_method': 'hist', 'device': 'cuda'} are passed directly into the underlying Booster. Quantile histogram generation and tree split searching run completely in parallel on CUDA streaming multiprocessors.
+
+STAGE 10: Event-Driven Backtest Simulation Loop
+  File: backtest/engine.py (lines 135-280)
+  Library: Python loop + Pandas (.itertuples()) + NumPy scalar math
+  GPU Capable Library: NO (Event-driven sequential bar simulation)
+  Configured for GPU Right Now: NO (Runs single-threaded on CPU)
+  Execution Details: Simulates bar-by-bar order book fills using Typical Price reference fills, tracks realized PnL, adjusts positions via ExposureManager, and triggers CircuitBreaker if daily drawdown breaches -2.0%.
+
+---
+STAGE 09 EXACT PARAMETERS PASSED TO .fit() AT RUNTIME:
+
+Model 1 (Directional Classifier):
+  tree_method      : 'hist'
+  device           : 'cuda'
+  objective        : 'binary:logistic'
+  eval_metric      : 'logloss'
+  max_depth        : 4
+  learning_rate    : 0.03971306363014029
+  n_estimators     : 184
+  subsample        : 0.7690232440243877
+  colsample_bytree : 0.8691829793773365
+  reg_alpha        : 0.4541742624547277
+  reg_lambda       : 0.01932384596046089
+  min_child_weight : 4
+  Booster device verified: cuda
+
+Model 2 (Price Movement Regressor):
+  tree_method      : 'hist'
+  device           : 'cuda'
+  objective        : 'reg:squarederror'
+  eval_metric      : 'rmse'
+  max_depth        : 6
+  learning_rate    : 0.02286033569382251
+  n_estimators     : 323
+  subsample        : 0.8315256355922427
+  colsample_bytree : 0.7194695185431752
+  reg_alpha        : 0.05060891236603858
+  reg_lambda       : 3.213827233989434e-07
+  min_child_weight : 3
+  Booster device verified: cuda
+
+Model 3 (Exhaustion Drawdown Regressor):
+  tree_method      : 'hist'
+  device           : 'cuda'
+  objective        : 'reg:squarederror'
+  eval_metric      : 'rmse'
+  max_depth        : 4
+  learning_rate    : 0.043184829495201985
+  n_estimators     : 361
+  subsample        : 0.9077957299180384
+  colsample_bytree : 0.7428386034089712
+  reg_alpha        : 2.062184808437188e-05
+  reg_lambda       : 0.03361399257050664
+  min_child_weight : 7
+  Booster device verified: cuda
+
+--------------------------------------------------------------------------------
+PART 2 -- CONFIRMATION OF NO SILENT CPU FALLBACK
+--------------------------------------------------------------------------------
+
+1. NVIDIA-SMI LIVE TELEMETRY LOG
+Direct hardware monitoring sampled at 200 ms intervals during the live .fit() execution window for RELIANCE (NVIDIA GeForce RTX 3050 Laptop GPU):
+
+FIT WINDOW 1: Model 1 (Directional Classifier)
+  Sample Count Handed to Fit: 786,664 Train / 196,666 Validation
+  Baseline Idle VRAM: 0 MiB
+  Peak Allocated VRAM: 205 MiB
+  Peak GPU Core Utilization: 74%
+  Mean GPU Core Utilization: 35.2%
+  Fallback to CPU Detected: NO (Confirmed 100% CUDA execution)
+
+FIT WINDOW 2: Model 2 (Price Movement Regressor)
+  Sample Count Handed to Fit: 786,664 Train / 196,666 Validation
+  Baseline Idle VRAM: 205 MiB
+  Peak Allocated VRAM: 211 MiB
+  Peak GPU Core Utilization: 74%
+  Mean GPU Core Utilization: 61.6%
+  Fallback to CPU Detected: NO (Confirmed 100% CUDA execution)
+
+FIT WINDOW 3: Model 3 (Exhaustion Regressor)
+  Sample Count Handed to Fit: 4,110,339 Train / 1,027,585 Validation
+  Baseline Idle VRAM: 211 MiB
+  Peak Allocated VRAM: 389 MiB
+  Peak GPU Core Utilization: 85%
+  Mean GPU Core Utilization: 63.9%
+  Fallback to CPU Detected: NO (Confirmed 100% CUDA execution)
+
+2. XGBOOST BUILD CONFIGURATION VERIFICATION
+Ran: python -c "import xgboost as xgb; import json; print(json.dumps(xgb.build_info(), indent=2))"
+Result:
+  USE_CUDA                  : True
+  CUDA_VERSION              : [13, 3]
+  THRUST_VERSION            : [3, 3, 3]
+  USE_OPENMP                : True
+  libxgboost                : "D:\\CODE\\rajasthani\\shitimon\\Lib\\site-packages\\xgboost\\lib\\xgboost.dll"
+  Build Confirmation        : Native CUDA GPU acceleration is fully compiled and active in the binary.
+
+3. DTYPE & DMATRIX MEMORY LAYOUT AUDIT
+Audited input feature matrices (X_tr5, X_va5, X_tr1, X_va1) immediately before passing to XGBoost:
+  X_tr5 Unique Dtypes       : {dtype('float64')}
+  X_tr1 Unique Dtypes       : {dtype('float64')}
+  Non-Numeric Columns X_tr5 : [] (Zero object, string, or mixed-type columns)
+  Non-Numeric Columns X_tr1 : [] (Zero object, string, or mixed-type columns)
+  Memory Contiguity         : C-contiguous dense float arrays in RAM
+  DMatrix Transfer Impact   : Zero host-side type casting or string parsing overhead. XGBoost QuantileDMatrix directly streams contiguous floating-point memory blocks into CUDA device VRAM without triggering CPU fallbacks.
+
+--------------------------------------------------------------------------------
+PART 3 -- WALL-CLOCK TIME BREAKDOWN (SINGLE FULL COMPANY CYCLE: RELIANCE)
+--------------------------------------------------------------------------------
+
+Measured using time.perf_counter() across the entire processing lifecycle of RELIANCE (972,466 raw 1-minute bars; 181,465 5-minute bars; 983,330 mixed 5m samples; 5,137,924 mixed 1m samples):
+
++-----------------------------------------------+---------------+--------------+-------------------------+
+| Stage Name                                    | Time (sec)    | % of Total   | Primary Device          |
++-----------------------------------------------+---------------+--------------+-------------------------+
+| 1. Parquet read time                          |    0.0605 s   |     0.18 %   | CPU (Polars)            |
+| 2. Feature engineering time                   |   14.7698 s   |    44.10 %   | CPU (Pandas, 1 core)    |
+| 3. Cross-asset peer injection time (18 cols)  |    0.7060 s   |     2.11 %   | CPU (Polars / Pandas)   |
+| 4. Purged CV fold generation time             |    2.0143 s   |     6.02 %   | CPU (NumPy)             |
+| 5. Replay buffer load + merge time            |    1.1981 s   |     3.58 %   | CPU (Polars / Pandas)   |
+| 6. Model 1 fit time (184 trees, 983k rows)    |    2.9954 s   |     8.94 %   | GPU (NVIDIA CUDA)       |
+| 7. Model 2 fit time (323 trees, 983k rows)    |    3.1001 s   |     9.26 %   | GPU (NVIDIA CUDA)       |
+| 8. Model 3 fit time (361 trees, 5.1M rows)    |    7.4782 s   |    22.33 %   | GPU (NVIDIA CUDA)       |
+| 9. Save/serialize time + GC clean             |    0.2768 s   |     0.83 %   | CPU / NVMe Disk         |
++-----------------------------------------------+---------------+--------------+-------------------------+
+| Total Measured Processing Time                |   33.4883 s   |   100.00 %   | Overall Cycle           |
++-----------------------------------------------+---------------+--------------+-------------------------+
+
+Key Summary Statistics:
+  Total CPU-Bound Time   : 18.7487 seconds (55.99% of total time)
+  Total GPU-Bound Time   : 13.5737 seconds (40.53% of total time)
+  Dominant Cost Stage    : Stage 2 (Feature Engineering) at 44.10% of total runtime
+
+--------------------------------------------------------------------------------
+PART 4 -- PANDAS VS. POLARS THREADING CHECK
+--------------------------------------------------------------------------------
+
+FINDING:
+In both feature_engine/zscore.py and feature_engine/indicators.py, operations are strictly:
+(a) Pandas methods (.rolling(), .ewm(), .groupby().transform(), .groupby().apply())
+These run single-threaded on exactly one CPU core. When groupby().transform(lambda x: ...) executes, Python's Global Interpreter Lock (GIL) serializes each session's evaluation. On a multi-core processor (e.g. 8 to 16 cores), 87% to 93% of CPU compute capacity sits completely idle during Stage 2.
+
+INVENTORY OF SINGLE-THREADED PANDAS ROLLING / EWM CALLS:
+
+File 1: feature_engine/zscore.py
+  1. _get_session_groups() (line 41):
+     Method: index.to_series().diff() > pd.Timedelta(hours=4)
+  2. basic_zscore() (lines 66-94):
+     Method: series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=1).mean().shift(1))
+     Method: series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std().shift(1))
+  3. rolling_zscore() (lines 98-136):
+     Method: series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=1).mean().shift(1))
+     Method: series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std(ddof=0).shift(1))
+  4. return_zscore() (lines 141-172):
+     Method: price_series.groupby(groups).transform(lambda x: x.pct_change())
+     Method: returns.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=1).mean().shift(1))
+     Method: returns.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std().shift(1))
+  5. log_return_zscore() (lines 176-207):
+     Method: price_series.groupby(groups).transform(lambda x: np.log(x / x.shift(1)))
+     Method: log_returns.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=1).mean().shift(1))
+     Method: log_returns.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std().shift(1))
+  6. volume_zscore() (lines 212-227):
+     Method: Calls self.basic_zscore() (inherits Pandas groupby.transform single-threaded loop)
+  7. volatility_zscore() (lines 232-267):
+     Method: return_series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std().shift(1))
+     Method: volatility.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=1).mean().shift(1))
+     Method: volatility.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std().shift(1))
+  8. price_vs_ma_zscore() (lines 271-296):
+     Method: price_series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=1).mean().shift(1))
+     Method: price_series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std().shift(1))
+  9. spread_zscore() (lines 300-320):
+     Method: Calls self.basic_zscore() on spread series
+  10. dollar_volume_zscore() (lines 325-334):
+     Method: Calls self.basic_zscore() on price * volume series
+  11. range_zscore() (lines 338-347):
+     Method: Calls self.basic_zscore() on percentage high-low range series
+  12. price_vs_ema_zscore() (lines 351-362):
+     Method: price_series.groupby(groups).transform(lambda x: x.ewm(span=span, adjust=False).mean().shift(1))
+     Method: price_series.groupby(groups).transform(lambda x: x.rolling(window=span, min_periods=2).std().shift(1))
+  13. skewness_zscore() (lines 366-378):
+     Method: return_series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=5).skew().shift(1))
+     Method: skew.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).mean().shift(1))
+     Method: skew.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std().shift(1))
+  14. kurtosis_zscore() (lines 382-394):
+     Method: return_series.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=5).kurt().shift(1))
+     Method: kurt.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).mean().shift(1))
+     Method: kurt.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std().shift(1))
+  15. momentum_zscore() (lines 398-410):
+     Method: price_series.groupby(groups).transform(lambda x: x.pct_change(periods=lag))
+     Method: mom.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=1).mean().shift(1))
+     Method: mom.groupby(groups).transform(lambda x: x.rolling(window=window, min_periods=2).std().shift(1))
+
+File 2: feature_engine/indicators.py
+  1. _get_session_groups() (lines 12-28):
+     Method: index.to_series().diff() > pd.Timedelta(hours=4)
+  2. rsi() (lines 30-62):
+     Method: price_series.groupby(groups, group_keys=False).apply(_calc_rsi)
+     Method: gain.ewm(com=period-1, min_periods=period).mean()
+     Method: loss.ewm(com=period-1, min_periods=period).mean()
+  3. vwap() (lines 64-90):
+     Method: (shifted_price * shifted_volume).groupby(groups).cumsum()
+     Method: shifted_volume.groupby(groups).cumsum()
+  4. distance_from_vwap() (lines 92-110):
+     Method: Calls self.vwap() and performs Pandas element-wise Series arithmetic
+  5. exhaustion_features() (lines 111-138):
+     Method: Combines volume_zscore(), distance_from_vwap(), and rsi()
+
+--------------------------------------------------------------------------------
+PART 5 -- CONCLUDING SUMMARY & ARCHITECTURAL VERDICT
+--------------------------------------------------------------------------------
+
+The performance profile indicates that XGBoost GPU execution is functioning as intended:
+Models 1 and 2 train nearly one million samples in ~3.0 seconds each, and Model 3 trains 5.14 million samples in 7.48 seconds on CUDA, achieving 74% to 85% GPU utilization with zero silent CPU fallback.
+
+However, the CPU bottleneck resides in Stage 2 (Feature Engineering), which accounts for 44.10% (14.77 seconds) of total processing time per company. This bottleneck is not caused by disk I/O, CV splitting, or replay buffer management (which together account for under 9% of runtime), but is directly driven by 19 single-threaded Pandas groupby().transform(lambda x: ...) and groupby().apply() calls in zscore.py and indicators.py. Because Pandas executes Python lambdas across intraday session groups sequentially under the Python GIL, CPU cores remain underutilized while a single core runs at 100%.
+
+Migrating zscore.py and indicators.py to native Polars expressions (utilizing expressions such as pl.col(...).rolling_mean(...).over("session") and Rust-level multi-threading) in a future optimization pass could reduce feature engineering time from ~15 seconds to under 1.5 seconds per company. This would reduce per-company cycle time from ~33.5 seconds to ~19.5 seconds, saving over 23 minutes across a full 100-company retrain.
+================================================================================
+END OF AUDIT REPORT
+================================================================================
+

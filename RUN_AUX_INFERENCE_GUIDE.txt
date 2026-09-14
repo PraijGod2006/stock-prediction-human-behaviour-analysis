@@ -1,0 +1,222 @@
+================================================================================
+RUN_AUX_INFERENCE.PY — COMPREHENSIVE CAPABILITIES & INTEGRATION GUIDE
+================================================================================
+
+1. WHAT IS run_aux_inference.py?
+--------------------------------------------------------------------------------
+run_aux_inference.py is the standalone, production-oriented execution engine of
+the 3-Model XGBoost Trading Pipeline.
+
+While test_inference_aux.py is an offline audit tool designed to evaluate
+historical accuracy against known future outcomes, run_aux_inference.py is
+built for FORWARD DEPLOYMENT. It takes any raw OHLCV minute-bar data, extracts
+features with zero lookahead leakage, feeds them into the three trained models,
+evaluates quantitative decision rules, and calculates exact ATR-sized trade
+orders ready for execution.
+
+
+2. CORE ARCHITECTURE: WHAT HAPPENS UNDER THE HOOD
+--------------------------------------------------------------------------------
+When you run this script on a CSV file, it executes 6 automated steps:
+
+Step 1: Raw Data Ingestion & Sanitization
+  - Strips any existing non-OHLCV columns or old features from the raw CSV.
+  - Normalizes timestamps to timezone-naive datetimes.
+  - Enforces columns: [date, open, high, low, close, volume].
+
+Step 2: Feature Engineering (No Lookahead Leakage)
+  - 5-Minute Resampling: Resamples 1-min bars into 5-min OHLCV bars.
+  - Computes Typical Price: TP = (High + Low + Close) / 3 as reference price.
+  - Computes 9 technical Z-scores on 5-min bars:
+    * return_zscore, log_return_zscore, rolling_zscore, volume_zscore,
+      volatility_zscore, price_vs_ma_zscore, price_vs_ema_zscore,
+      range_zscore, momentum_zscore.
+  - Computes 12 technical features on 1-min bars (for exhaustion model):
+    * 1-min Z-scores, 20-min Volume Z-score, VWAP Distance, and RSI(14).
+  - All rolling metrics use shift(1) so bar T NEVER sees bar T.
+
+Step 3: Cross-Asset Peer Momentum Injection
+  - Reads artifacts/peer_map.json.
+  - Injects 18 shift(1)-lagged peer momentum features across all 3 correlation
+    dimensions:
+    * Raw Returns     : top 3 positive + top 3 negative peers (6 cols)
+    * Binary Direction: top 3 positive + top 3 negative peers (6 cols)
+    * Spike (0.2%)    : top 3 positive + top 3 negative peers (6 cols)
+  - If processing an Index (--index), all 18 peer columns are cleanly set to 0.0.
+
+Step 4: Parallel 3-Model XGBoost Inference
+  - Model 1 (Directional Classifier):
+    Input: 27 features (9 technical + 18 peer lags).
+    Output: Binary direction (UP/DOWN) and probability confidence score.
+  - Model 2 (Price Movement Regressor):
+    Input: 27 features.
+    Output: Predicted return of the first 1-minute bar of the next 5-min window.
+  - Model 3 (Exhaustion Drawdown Regressor):
+    Input: 12 features on 1-min data.
+    Output: Predicted maximum drawdown over the forward 10-minute window.
+
+Step 5: Multi-Model Signal Combiner
+  Evaluates 4 distinct signal conditions:
+  1. MOMENTUM_BUY:
+     Model 1 predicts UP with probability >= confidence hurdle (default 0.52)
+     AND Model 2 predicts positive drift (return > 0).
+  2. MOMENTUM_SELL:
+     Model 1 predicts DOWN with probability >= confidence hurdle
+     AND Model 2 predicts negative drift (return < 0).
+  3. MEAN_REVERSION_BUY:
+     Model 1 predicts UP, but Model 3 detects a severe incoming intraday flush
+     (drawdown < -0.3%). Generates a limit buy order at the bottom of the flush:
+     Entry Price = Current_Price * (1.0 - abs(Predicted_Drawdown)).
+  4. HOLD:
+     All other conditions where model consensus is absent or confidence is low.
+
+Step 6: Risk Management & ATR Position Sizing
+  - Calculates 14-period Average True Range (ATR-14) from 5-minute bars.
+  - Applies 2% risk-per-trade rule:
+    Risk Amount = Capital * 0.02
+    Shares = Risk Amount / (2.0 * ATR)
+  - Enforces 10% maximum portfolio exposure cap per single asset.
+  - Outputs exact integer shares and total INR capital allocation.
+
+
+3. WHAT YOU CAN DO WITH THIS SCRIPT
+--------------------------------------------------------------------------------
+
+USE CASE 1: Live / Paper Trading Signal Generator
+-------------------------------------------------
+You can run this script periodically (e.g., every 5 minutes at bar close)
+against your live data feed.
+- Save the current session's incoming 1-minute bars to a CSV file.
+- Call run_aux_inference.py on that CSV.
+- Read the last row of the output CSV to get the immediate signal, the exact
+  recommended entry price, and the exact number of shares to purchase.
+
+USE CASE 2: Broker & Order Management System (OMS) Integration
+--------------------------------------------------------------
+You can import the function `run_inference()` directly into your trading bot
+or execution script (e.g. connected to Zerodha Kite Connect, Angel One SmartAPI,
+Upstox, Interactive Brokers, or Dhan).
+- The function returns a clean Pandas DataFrame with all columns needed by
+  an OMS: [timestamp, symbol, signal, entry_price, shares, position_value].
+- Your execution script simply checks if `signal != "HOLD"`, and if true,
+  fires the order to the broker API with `shares` quantity and `entry_price`.
+
+USE CASE 3: Threshold & Sensitivity Optimization
+------------------------------------------------
+You can experiment with different confidence hurdles and capital allocations:
+- Stricter Quality Filter:
+    python trading_pipeline/run_aux_inference.py --csv "path/to/stock.csv" --conf 0.60
+    (Only takes high-conviction trades where Model 1 probability exceeds 60%)
+- Higher Capital Sizing:
+    In code: pass `capital=500000.0` to scale position sizes to a 5 Lakh portfolio.
+
+USE CASE 4: Historical Trade Opportunity Scanning (Batch Processing)
+-------------------------------------------------------------------
+You can scan across multiple stock CSVs or daily folders to generate a master
+log of where trading opportunities occurred across the market.
+- Loop over all 50 constituent CSVs in a session folder.
+- Aggregate the output CSVs into an execution journal.
+
+USE CASE 5: Index Momentum & Trend Analysis
+-------------------------------------------
+You can analyze broad market indices (e.g., NIFTY 50, NIFTY BANK, IT, FINNIFTY)
+or bond indices (e.g., BHARATBOND):
+- Add the `--index` flag to instruct the feature engine that volume is flat (0.0)
+  and cross-asset stock peers are disabled.
+- The pipeline outputs trend and exhaustion signals for the overall macro index.
+
+
+4. CLI USAGE & COMMAND RECIPES
+--------------------------------------------------------------------------------
+
+A. Run on a single stock (e.g. TCS from Aux Data 1):
+python trading_pipeline/run_aux_inference.py --csv "DATA/aux data 1/nifty50_01Jun/nifty50_01Jun/TCS_01Jun.csv"
+
+B. Run on RELIANCE with a higher confidence hurdle (60%):
+python trading_pipeline/run_aux_inference.py --csv "DATA/aux data 1/nifty50_01Jun/nifty50_01Jun/RELIANCE_01Jun.csv" --conf 0.60
+
+C. Run on an index file (Aux Data 2) with custom output path:
+python trading_pipeline/run_aux_inference.py --csv "DATA/aux data 2/BHARATBOND-APR30_minute.csv" --symbol BHARATBOND --index --out "artifacts/inference_results/bharatbond_orders.csv"
+
+D. Explicit symbol naming (if CSV filename does not start with symbol):
+python trading_pipeline/run_aux_inference.py --csv "path/to/my_data.csv" --symbol INFY
+
+
+5. PROGRAMMATIC USAGE: HOW TO USE IN PYTHON SCRIPTS
+--------------------------------------------------------------------------------
+You do not have to use the command line; you can import it directly into your
+own Python trading loops:
+
+```python
+import sys
+sys.path.insert(0, "d:/CODE/rajasthani/trading_pipeline")
+
+from run_aux_inference import load_models, run_inference
+
+# 1. Load trained models once (cached in memory)
+model_1, model_2, model_3 = load_models()
+
+# 2. Run inference on any incoming CSV
+df_signals = run_inference(
+    csv_path="DATA/aux data 1/nifty50_01Jun/nifty50_01Jun/RELIANCE_01Jun.csv",
+    symbol="RELIANCE",
+    model_1=model_1,
+    model_2=model_2,
+    model_3=model_3,
+    is_stock=True,
+    confidence_hurdle=0.52,
+    capital=100000.0   # 1 Lakh INR portfolio
+)
+
+# 3. Check the most recent 5-minute bar
+latest_bar = df_signals.iloc[-1]
+print(f"Timestamp   : {latest_bar['timestamp']}")
+print(f"Signal      : {latest_bar['signal']}")
+print(f"Entry Price : INR {latest_bar['entry_price']}")
+print(f"Shares      : {latest_bar['shares']}")
+print(f"Confidence  : {latest_bar['m1_confidence']:.2%}")
+
+# 4. Trigger order if actionable
+if latest_bar["signal"] != "HOLD" and latest_bar["shares"] > 0:
+    print(f"--> SUBMIT ORDER: {latest_bar['signal']} {latest_bar['shares']} shares of RELIANCE at {latest_bar['entry_price']}")
+```
+
+
+6. OUTPUT DATA SCHEMA (WHAT EACH COLUMN IN THE OUTPUT CSV MEANS)
+--------------------------------------------------------------------------------
+When run_aux_inference.py saves {SYMBOL}_inference_output.csv, it contains:
+
+COLUMN              | TYPE    | MEANING / USE
+--------------------+---------+--------------------------------------------------
+timestamp           | string  | Exact datetime of the 5-minute bar.
+symbol              | string  | Ticker symbol (e.g. TCS, RELIANCE).
+signal              | string  | Action: MOMENTUM_BUY, MOMENTUM_SELL,
+                    |         | MEAN_REVERSION_BUY, or HOLD.
+entry_price         | float   | Recommended fill price (in INR).
+                    |         | For momentum trades: current market Typical Price.
+                    |         | For mean reversion: dip limit price based on M3.
+ref_price           | float   | Current bar Typical Price = (High + Low + Close)/3.
+m1_direction        | int     | Model 1 binary prediction: 1 (UP) or 0 (DOWN).
+m1_confidence       | float   | Model 1 predicted probability of upward movement.
+m2_price_move       | float   | Model 2 predicted 1-minute return (e.g. +0.00045).
+m3_drawdown         | float   | Model 3 predicted forward 10-min drawdown (e.g. -0.0042).
+atr_14              | float   | 14-period Average True Range volatility metric.
+shares              | int     | Exact number of shares to buy/sell based on ATR risk.
+position_value      | float   | Total INR value of the order (shares * entry_price).
+
+
+7. SUMMARY OF DIFFERENCES: WHEN TO USE THIS VS OTHER CODEBASE FILES
+--------------------------------------------------------------------------------
+- Use run_aux_inference.py:
+  When you want fast, clean, actionable signals, order prices, and share quantities
+  to execute or simulate trading on any CSV.
+
+- Use test_inference_aux.py:
+  When you want to evaluate out-of-sample accuracy, test win rates, and verify
+  classification/regression metrics against known ground truth.
+
+- Use run_backtest.py:
+  When you want full multi-day backtesting with portfolio cash tracking, slippage,
+  transaction costs, and equity curve generation.
+================================================================================
+

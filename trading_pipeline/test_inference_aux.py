@@ -27,9 +27,9 @@ data from two external auxiliary sources:
 THE 3-MODEL SYSTEM:
 -------------------
 - Model 1 (Directional): XGBClassifier -> 5-min binary UP/DOWN prediction.
-  Features (15): 9 technical z-scores + 6 cross-asset peer momentum lags.
+  Features (27): 9 technical z-scores + 18 cross-asset peer momentum lags (raw, binary, spike).
 - Model 2 (Price Movement): XGBRegressor -> 1-min return prediction of next bar.
-  Features (15): Exact same 15 features as Model 1.
+  Features (27): Exact same 27 features as Model 1.
 - Model 3 (Exhaustion): XGBRegressor -> 10-min forward maximum drawdown.
   Features (12): 1-min z-scores, Volume Z(20), VWAP Distance, and RSI(14).
 
@@ -106,6 +106,9 @@ from models.model_1_direction import DirectionalModel
 from models.model_2_price import PriceModel
 from models.model_3_exhaustion import ExhaustionModel
 
+from correlation.cross_asset import DEFAULT_PEER_COLS
+from feature_engine.reference_price import compute_reference_price
+
 # ---------------------------------------------------------------------------
 # CONFIGURATION & CONSTANTS
 # ---------------------------------------------------------------------------
@@ -124,7 +127,7 @@ RESULTS_DIR = os.path.join(ARTIFACTS_DIR, "inference_results")
 # Mean-Reversion Exhaustion Threshold (Section 5): -0.3% expected drawdown
 EXHAUSTION_THRESHOLD = -0.003
 
-# Exact feature names expected by Model 1 (Direction) and Model 2 (Price)
+# Exact feature names expected by Model 1 (Direction) and Model 2 (Price) (29 columns: 11 technical + 18 peer)
 EXPECTED_FEATURES_5MIN = [
     "return_zscore",
     "log_return_zscore",
@@ -135,15 +138,11 @@ EXPECTED_FEATURES_5MIN = [
     "price_vs_ema_zscore",
     "range_zscore",
     "momentum_zscore",
-    "peer_pos_1_return_lag1",
-    "peer_pos_2_return_lag1",
-    "peer_pos_3_return_lag1",
-    "peer_neg_1_return_lag1",
-    "peer_neg_2_return_lag1",
-    "peer_neg_3_return_lag1",
-]
+    "bollinger_pctb",
+    "bollinger_bandwidth",
+] + DEFAULT_PEER_COLS
 
-# Exact feature names expected by Model 3 (Exhaustion)
+# Exact feature names expected by Model 3 (Exhaustion) & Model 3b (Runup) (16 columns)
 EXPECTED_FEATURES_1MIN = [
     "return_zscore",
     "log_return_zscore",
@@ -157,15 +156,10 @@ EXPECTED_FEATURES_1MIN = [
     "volume_zscore_20",
     "distance_from_vwap",
     "rsi_14",
-]
-
-DEFAULT_PEER_COLS = [
-    "peer_pos_1_return_lag1",
-    "peer_pos_2_return_lag1",
-    "peer_pos_3_return_lag1",
-    "peer_neg_1_return_lag1",
-    "peer_neg_2_return_lag1",
-    "peer_neg_3_return_lag1",
+    "relative_volume_tod",
+    "bollinger_pctb",
+    "bollinger_dist_upper",
+    "bollinger_bandwidth",
 ]
 
 
@@ -251,7 +245,8 @@ def inject_contemporaneous_peers(
     day_folder: str | None = None,
 ) -> pd.DataFrame:
     """
-    Injects 6 peer momentum features (top 3 correlated, top 3 inversely correlated).
+    Injects 18 peer momentum features across all 3 correlation dimensions
+    (raw returns, binary direction, 0.2% return spike).
     
     Priority:
     1. Check if the peer CSV exists in the same day directory (contemporaneous 2026 data).
@@ -261,7 +256,7 @@ def inject_contemporaneous_peers(
     print(f"    [Step 2/6: Cross-Asset Injection] Checking peer relationships for {symbol}...")
     
     if not os.path.exists(PEER_MAP_PATH):
-        print("      -> peer_map.json not found. Setting default 6 peer columns to 0.0.")
+        print("      -> peer_map.json not found. Setting default 18 peer columns to 0.0.")
         for col in DEFAULT_PEER_COLS:
             df_5min[col] = 0.0
         return df_5min
@@ -270,36 +265,49 @@ def inject_contemporaneous_peers(
         peer_map = json.load(f)
 
     if symbol not in peer_map:
-        print(f"      -> {symbol} not in peer_map.json. Setting default 6 peer columns to 0.0.")
+        print(f"      -> {symbol} not in peer_map.json. Setting default 18 peer columns to 0.0.")
         for col in DEFAULT_PEER_COLS:
             df_5min[col] = 0.0
         return df_5min
 
-    peers_pos = peer_map[symbol].get("top_positive", [])[:3]
-    peers_neg = peer_map[symbol].get("top_negative", [])[:3]
-    print(f"      -> Correlated Peers: +{peers_pos} | Inversely Correlated: -{peers_neg}")
+    sym_data = peer_map[symbol]
+    if "correlated_peers_raw" in sym_data:
+        dimensions = {
+            "raw": sym_data["correlated_peers_raw"],
+            "binary": sym_data["correlated_peers_binary"],
+            "spike": sym_data["correlated_peers_spike"],
+        }
+    else:
+        dimensions = {
+            "raw": {"top_positive": sym_data.get("top_positive", []), "top_negative": sym_data.get("top_negative", [])},
+            "binary": {"top_positive": [], "top_negative": []},
+            "spike": {"top_positive": [], "top_negative": []},
+        }
 
-    # Process Positive Peers
-    for rank, peer in enumerate(peers_pos):
-        col_name = f"peer_pos_{rank + 1}_return_lag1"
-        peer_ret = _extract_peer_return(peer, day_folder)
-        if peer_ret is not None:
-            df_5min = df_5min.join(peer_ret.rename(col_name), how="left")
-            print(f"         + Injected contemporaneous {col_name} from {peer}")
-        else:
-            df_5min[col_name] = 0.0
+    for dim_name, dim_data in dimensions.items():
+        pos_list = dim_data.get("top_positive", [])[:3]
+        neg_list = dim_data.get("top_negative", [])[:3]
+        print(f"      -> [{dim_name.upper()}] Peers: +{pos_list} | -{neg_list}")
 
-    # Process Negative Peers
-    for rank, peer in enumerate(peers_neg):
-        col_name = f"peer_neg_{rank + 1}_return_lag1"
-        peer_ret = _extract_peer_return(peer, day_folder)
-        if peer_ret is not None:
-            df_5min = df_5min.join(peer_ret.rename(col_name), how="left")
-            print(f"         - Injected contemporaneous {col_name} from {peer}")
-        else:
-            df_5min[col_name] = 0.0
+        # Process Positive Peers
+        for rank, peer in enumerate(pos_list):
+            col_name = f"peer_pos_{dim_name}_{rank + 1}_return_lag1"
+            peer_ret = _extract_peer_return(peer, day_folder)
+            if peer_ret is not None:
+                df_5min = df_5min.join(peer_ret.rename(col_name), how="left")
+            else:
+                df_5min[col_name] = 0.0
 
-    # Ensure all 6 columns exist and fill NaNs
+        # Process Negative Peers
+        for rank, peer in enumerate(neg_list):
+            col_name = f"peer_neg_{dim_name}_{rank + 1}_return_lag1"
+            peer_ret = _extract_peer_return(peer, day_folder)
+            if peer_ret is not None:
+                df_5min = df_5min.join(peer_ret.rename(col_name), how="left")
+            else:
+                df_5min[col_name] = 0.0
+
+    # Ensure all 18 columns exist and fill NaNs
     for col in DEFAULT_PEER_COLS:
         if col not in df_5min.columns:
             df_5min[col] = 0.0
@@ -311,7 +319,7 @@ def inject_contemporaneous_peers(
 
 def _extract_peer_return(peer: str, day_folder: str | None) -> pd.Series | None:
     """
-    Helper to extract shift(1)-lagged 5-minute returns for a peer stock.
+    Helper to extract shift(1)-lagged 5-minute returns for a peer stock using Typical Price.
     Checks the local day folder first, then historical parquet.
     """
     # 1. Search in the day's folder
@@ -323,7 +331,7 @@ def _extract_peer_return(peer: str, day_folder: str | None) -> pd.Series | None:
                 pdf_std = standardize_aux1_csv(pdf_raw, peer)
                 if len(pdf_std) > 10:
                     p_5m = build_features_5min(pdf_std)
-                    # 5-minute lagged return with shift(1) leakage guard
+                    # 5-minute lagged return with shift(1) leakage guard (uses Typical Price in mid_price)
                     p_ret = (p_5m["mid_price"] / p_5m["mid_price"].shift(1) - 1.0).shift(1)
                     return p_ret
             except Exception:  # noqa: BLE001, S110
@@ -333,10 +341,10 @@ def _extract_peer_return(peer: str, day_folder: str | None) -> pd.Series | None:
     parquet_path = os.path.join(PARQUET_DIR, f"{peer}.parquet")
     if os.path.exists(parquet_path):
         try:
-            p_raw = pd.read_parquet(parquet_path, columns=["date", "open", "close"])
+            p_raw = pd.read_parquet(parquet_path, columns=["date", "high", "low", "close"])
             p_raw["date"] = pd.to_datetime(p_raw["date"])
             p_raw = p_raw.set_index("date")
-            p_mid = (p_raw["open"] + p_raw["close"]) / 2.0
+            p_mid = compute_reference_price(p_raw)
             p_ret = (p_mid / p_mid.shift(5) - 1.0).shift(1)
             return p_ret
         except Exception:  # noqa: BLE001, S110
@@ -402,7 +410,7 @@ def run_inference_verbose(
     if is_stock:
         df_5min = inject_contemporaneous_peers(df_5min, symbol, day_folder=day_folder)
     else:
-        print("    [Step 2/6: Cross-Asset Injection] Index Asset: Populating 6 peer columns with 0.0.")
+        print("    [Step 2/6: Cross-Asset Injection] Index Asset: Populating 18 peer columns with 0.0.")
         for col in DEFAULT_PEER_COLS:
             df_5min[col] = 0.0
 
@@ -853,19 +861,21 @@ def evaluate_single_stock_metrics(
         # -------------------------------------------------------------------
         # COMPUTE GROUND TRUTH FOR THIS SESSION
         # -------------------------------------------------------------------
-        # Ground Truth 1 (Direction): Did the next 5-min close go UP?
-        next_close_5m = df_5min["close"].shift(-1).reindex(X_5min.index)
-        curr_close_5m = df_5min["close"].reindex(X_5min.index)
-        y_true_dir = (next_close_5m > curr_close_5m).astype(float)
+        # Ground Truth 1 (Direction): Did the next 5-min Typical Price go UP?
+        ref_5m = compute_reference_price(df_5min) if all(c in df_5min.columns for c in ['high', 'low', 'close']) else df_5min['close']
+        next_ref_5m = ref_5m.shift(-1).reindex(X_5min.index)
+        curr_ref_5m = ref_5m.reindex(X_5min.index)
+        y_true_dir = (next_ref_5m > curr_ref_5m).astype(float)
 
-        # Ground Truth 2 (Price Move): Actual return of next 5-min bar
-        y_true_ret = (next_close_5m - curr_close_5m) / curr_close_5m
+        # Ground Truth 2 (Price Move): Actual return of next 5-min Typical Price
+        y_true_ret = (next_ref_5m - curr_ref_5m) / curr_ref_5m
 
         # Ground Truth 3 (Drawdown): Actual forward 10-bar minimum drawdown on 1-min data
         reversed_low = df_1min["low"].iloc[::-1]
         rolling_min_low = reversed_low.rolling(10, min_periods=10).min().iloc[::-1].shift(-1).reindex(X_1min.index)
-        curr_close_1m = df_1min["close"].reindex(X_1min.index)
-        y_true_drawdown = ((rolling_min_low - curr_close_1m) / curr_close_1m).clip(lower=-0.15, upper=0.0)
+        ref_1m = compute_reference_price(df_1min) if all(c in df_1min.columns for c in ['high', 'low', 'close']) else df_1min['close']
+        curr_ref_1m = ref_1m.reindex(X_1min.index)
+        y_true_drawdown = ((rolling_min_low - curr_ref_1m) / curr_ref_1m).clip(lower=-0.15, upper=0.0)
 
         # Align lengths
         min_len = min(len(X_5min), len(pred_dir), len(pred_price))

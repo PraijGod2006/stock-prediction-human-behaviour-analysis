@@ -169,15 +169,24 @@ def optimize_hyperparameters(
             import xgboost as xgb
             
             if is_classifier:
-                model = xgb.XGBClassifier(
-                    **params,
-                    tree_method='hist',
-                    device='cuda',
-                    random_state=42,
-                    eval_metric='logloss',
-                    early_stopping_rounds=30,
-                    verbosity=0
-                )
+                unique_classes = np.unique(y_train[y_train.notna()])
+                num_cls = len(unique_classes)
+                clf_kwargs = {
+                    'tree_method': 'hist',
+                    'device': 'cuda',
+                    'random_state': 42,
+                    'early_stopping_rounds': 30,
+                    'verbosity': 0
+                }
+                if num_cls > 2:
+                    clf_kwargs['objective'] = 'multi:softprob'
+                    clf_kwargs['num_class'] = num_cls
+                    clf_kwargs['eval_metric'] = 'mlogloss'
+                else:
+                    clf_kwargs['objective'] = 'binary:logistic'
+                    clf_kwargs['eval_metric'] = 'logloss'
+
+                model = xgb.XGBClassifier(**params, **clf_kwargs)
                 model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
                 preds = model.predict(X_val)
                 # Accuracy score

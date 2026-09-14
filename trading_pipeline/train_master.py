@@ -8,14 +8,15 @@ This is the brain of the entire training pipeline. It:
 2. For each company:
    a. Loads Parquet data into a DataFrame.
    b. Engineers 1-min and 5-min features via feature_engine/pipeline.py.
-   c. Injects cross-asset correlation signals (for Model 1).
-   d. Prepares targets for all 3 models:
-      - Model 1: Direction (binary up/down for next 5-min close)
+   c. Injects cross-asset correlation signals (for Models 1 & 2).
+   d. Prepares targets for all 4 models:
+      - Model 1: Direction (3-class triple-barrier: DOWN=0, FLAT=1, UP=2, >=2x cost)
       - Model 2: Price (Section 13 exact alignment: 1-min return of first bar in next window)
-      - Model 3: Exhaustion (10-minute forward maximum drawdown)
+      - Model 3: Exhaustion (10-minute forward maximum drawdown, [-0.15, 0.0])
+      - Model 3b: Runup (10-minute forward maximum upside excursion, [0.0, 0.15])
    e. Employs PurgedWalkForwardCV (with purge and embargo gaps) to eliminate leakage.
    f. Mixes separate 5-min and 1-min replay buffers to mitigate catastrophic forgetting.
-   g. Continues training all 3 XGBoost models using incremental warm-start (xgb_model=).
+   g. Continues training all 4 XGBoost models using incremental warm-start (xgb_model=).
    h. Logs out-of-sample metrics and checks for PSI feature drift.
 3. Every 25 companies, triggers a full retrain from the replay buffers to reset drift.
 4. Frees memory after every single company (del + gc.collect).
@@ -26,6 +27,7 @@ import gc
 import glob
 import json
 import os
+import shutil
 import sys
 
 import numpy as np
@@ -41,6 +43,7 @@ from feature_engine.pipeline import build_features_1min, build_features_5min
 from models.model_1_direction import DirectionalModel
 from models.model_2_price import PriceModel
 from models.model_3_exhaustion import ExhaustionModel
+from models.model_3b_runup import RunupModel
 from monitoring.drift_detector import DriftDetector
 from monitoring.metrics_logger import MetricsLogger
 from validation.purged_cv import PurgedWalkForwardCV, optimize_hyperparameters
@@ -56,9 +59,10 @@ PEER_MAP_PATH = os.path.join(ARTIFACTS_DIR, "peer_map.json")
 MODEL_1_PATH = os.path.join(ARTIFACTS_DIR, "model_1_direction.json")
 MODEL_2_PATH = os.path.join(ARTIFACTS_DIR, "model_2_price.json")
 MODEL_3_PATH = os.path.join(ARTIFACTS_DIR, "model_3_exhaustion.json")
+MODEL_3B_PATH = os.path.join(ARTIFACTS_DIR, "model_3b_runup.json")
 BEST_HYPERPARAMS_PATH = os.path.join(ARTIFACTS_DIR, "best_hyperparameters.json")
 
-# Replay buffer paths -- separate files for 5-min (Models 1&2) and 1-min (Model 3)
+# Replay buffer paths -- separate files for 5-min (Models 1&2) and 1-min (Models 3&3b)
 REPLAY_5MIN_PATH = os.path.join(ARTIFACTS_DIR, "replay_buffer_5min.parquet")
 REPLAY_1MIN_PATH = os.path.join(ARTIFACTS_DIR, "replay_buffer_1min.parquet")
 
@@ -80,6 +84,57 @@ def _safe_write_parquet(df_polars: pl.DataFrame, path: str) -> None:
     df_polars.write_parquet(temp_path)
     gc.collect()
     os.replace(temp_path, path)
+
+
+def perform_priority2_reset() -> None:
+    """
+    Phase 1 Reset Checklist:
+    1. Archives existing pre-Priority-2 models & configs with _pre_priority2 suffix.
+    2. Deletes replay buffers (schema change).
+    3. Cleans any temporary files.
+    """
+    print("\n" + "=" * 70)
+    print("PHASE 1 RESET: Archiving pre-priority2 artifacts and clearing replay buffers...")
+    print("=" * 70)
+    artifacts = [
+        "model_1_direction.json",
+        "model_2_price.json",
+        "model_3_exhaustion.json",
+        "model_3b_runup.json",
+        "best_hyperparameters.json",
+        "training_log.json",
+        "drift_log.json",
+        "signals.csv",
+    ]
+    for art in artifacts:
+        p = os.path.join(ARTIFACTS_DIR, art)
+        if os.path.exists(p):
+            base, ext = os.path.splitext(art)
+            archive_p = os.path.join(ARTIFACTS_DIR, f"{base}_pre_priority2{ext}")
+            try:
+                shutil.copy2(p, archive_p)
+                print(f"  -> Archived: {art} -> {os.path.basename(archive_p)}")
+            except Exception as e:
+                print(f"  -> Warning archiving {art}: {e}")
+
+    # Delete replay buffers due to schema changes (3-class target, runup target, bollinger features)
+    for buf in ["replay_buffer_5min.parquet", "replay_buffer_1min.parquet"]:
+        bp = os.path.join(ARTIFACTS_DIR, buf)
+        if os.path.exists(bp):
+            try:
+                os.remove(bp)
+                print(f"  -> Deleted old replay buffer: {buf}")
+            except Exception as e:
+                print(f"  -> Warning deleting {buf}: {e}")
+
+    # Delete any temporary files
+    for tmp in glob.glob(os.path.join(ARTIFACTS_DIR, "*.tmp")):
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+    print("=" * 70 + "\n")
 
 
 def update_replay_buffer_5min(
@@ -120,16 +175,18 @@ def update_replay_buffer_5min(
 def update_replay_buffer_1min(
     X_1min: pd.DataFrame,
     y_exhaust: pd.Series,
+    y_runup: pd.Series,
     symbol: str
 ) -> None:
     """
-    Adds a 5% random sample of 1-min data to the replay buffer for Model 3.
+    Adds a 5% random sample of 1-min data to the replay buffer for Models 3 & 3b.
     """
     n_sample = max(1, int(len(X_1min) * REPLAY_SAMPLE_RATE))
     idx = np.random.choice(len(X_1min), size=min(n_sample, len(X_1min)), replace=False)
 
     sample = X_1min.iloc[idx].copy()
     sample['__target_exhaust'] = y_exhaust.iloc[idx].to_numpy()
+    sample['__target_runup'] = y_runup.iloc[idx].to_numpy()
     sample['__symbol'] = symbol
 
     new_buffer = pl.from_pandas(sample)
@@ -162,15 +219,16 @@ def load_replay_5min() -> tuple[pd.DataFrame, pd.Series, pd.Series] | None:
         return None
 
 
-def load_replay_1min() -> tuple[pd.DataFrame, pd.Series] | None:
-    """Loads 1-min replay buffer. Returns (X, y_exhaust) or None."""
+def load_replay_1min() -> tuple[pd.DataFrame, pd.Series, pd.Series] | None:
+    """Loads 1-min replay buffer. Returns (X, y_exhaust, y_runup) or None."""
     if not os.path.exists(REPLAY_1MIN_PATH):
         return None
     try:
         buffer = pl.read_parquet(REPLAY_1MIN_PATH, memory_map=False).to_pandas()
-        meta_cols = ['__target_exhaust', '__symbol']
+        meta_cols = ['__target_exhaust', '__target_runup', '__symbol']
         feature_cols = [c for c in buffer.columns if c not in meta_cols]
-        return pd.DataFrame(buffer[feature_cols]), pd.Series(buffer['__target_exhaust'])
+        y_run = buffer['__target_runup'] if '__target_runup' in buffer.columns else pd.Series(np.zeros(len(buffer)))
+        return pd.DataFrame(buffer[feature_cols]), pd.Series(buffer['__target_exhaust']), pd.Series(y_run)
     except Exception:  # noqa: BLE001
         return None
 
@@ -191,10 +249,27 @@ def clean_data(X: pd.DataFrame, y: pd.Series) -> tuple[pd.DataFrame, pd.Series]:
     return pd.DataFrame(X_clean[valid]), pd.Series(y_clean[valid])
 
 
+def clean_data_1min(
+    X: pd.DataFrame,
+    y_exh: pd.Series,
+    y_run: pd.Series
+) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+    """
+    Cleans 1-minute features and both targets (exhaustion & runup) with aligned indices.
+    """
+    X_clean = X.replace([np.inf, -np.inf], np.nan)
+    y_e = y_exh.replace([np.inf, -np.inf], np.nan)
+    y_r = y_run.replace([np.inf, -np.inf], np.nan)
+
+    X_clean = X_clean.dropna(axis=1, how='all')
+    valid = X_clean.notna().all(axis=1) & y_e.notna() & y_r.notna()
+    return pd.DataFrame(X_clean[valid]), pd.Series(y_e[valid]), pd.Series(y_r[valid])
+
+
 def run_hyperparameter_tuning(first_parquet_path: str) -> None:
     """
-    Fix Group D: Runs Optuna Bayesian hyperparameter tuning on the first company's data
-    across all purged CV folds, and persists the best parameters to artifacts/best_hyperparameters.json.
+    Fix Group D + Priority-2: Runs Optuna Bayesian hyperparameter tuning across all
+    4 models (Directional 3-class, Price Regressor, Exhaustion Regressor, Runup Regressor).
     """
     symbol = os.path.basename(first_parquet_path).replace(".parquet", "")
     print("\n" + "=" * 70)
@@ -215,8 +290,10 @@ def run_hyperparameter_tuning(first_parquet_path: str) -> None:
         m1_tmp = DirectionalModel()
         m2_tmp = PriceModel()
         m3_tmp = ExhaustionModel()
+        m3b_tmp = RunupModel()
 
-        y_dir_df = m1_tmp.prepare_target(df_5min)
+        # Target preparation: pass df_1min to Model 1 for triple barrier
+        y_dir_df = m1_tmp.prepare_target(df_5min, df_1min=df_1min)
         y_price_df = m2_tmp.prepare_target(df_5min, df_1min=df_1min)
 
         target_dir_s = pd.Series(y_dir_df['target'], name='target_dir')
@@ -227,7 +304,8 @@ def run_hyperparameter_tuning(first_parquet_path: str) -> None:
         drop_cols = [
             'date', 'symbol', 'open', 'high', 'low', 'close', 'volume',
             'mid_price', 'future_close_5m', 'target', '__target_dir',
-            '__target_price', '__target_exhaust', '__symbol'
+            '__target_price', '__target_exhaust', '__target_runup',
+            '__barrier_distance_pct', '__symbol'
         ]
         X_5min = pd.DataFrame(df_5min.loc[common_idx_5m, [c for c in df_5min.columns if c not in drop_cols]])
         y_dir = pd.Series(targets_5m.loc[common_idx_5m, 'target_dir'])
@@ -242,14 +320,19 @@ def run_hyperparameter_tuning(first_parquet_path: str) -> None:
         y_dir = pd.Series(y_dir[valid_5m])
         y_price = pd.Series(y_price[valid_5m])
 
-        df_1min_target = m3_tmp.prepare_target(df_1min)
-        y_exhaust_raw = pd.Series(df_1min_target['target'])
-        X_1min_raw = pd.DataFrame(df_1min_target[[c for c in df_1min_target.columns if c not in drop_cols]])
-        X_1min, y_exhaust = clean_data(X_1min_raw, y_exhaust_raw)
+        # 1-minute targets
+        df_1min_target_exh = m3_tmp.prepare_target(df_1min)
+        df_1min_target_run = m3b_tmp.prepare_target(df_1min)
+        common_1m = df_1min_target_exh.index.intersection(df_1min_target_run.index)
+
+        y_exhaust_raw = pd.Series(df_1min_target_exh.loc[common_1m, 'target'])
+        y_runup_raw = pd.Series(df_1min_target_run.loc[common_1m, 'target'])
+        X_1min_raw = pd.DataFrame(df_1min.loc[common_1m, [c for c in df_1min.columns if c not in drop_cols]])
+        X_1min, y_exhaust, y_runup = clean_data_1min(X_1min_raw, y_exhaust_raw, y_runup_raw)
 
         print(f"  [Optuna Tuning] Samples: 5m={len(X_5min):,} rows, 1m={len(X_1min):,} rows")
 
-        print("  -> Running Optuna trials for Model 1 (Directional Classifier)...")
+        print("  -> Running Optuna trials for Model 1 (Directional 3-Class Classifier)...")
         best_m1 = optimize_hyperparameters(
             X_5min, y_dir, DirectionalModel, n_trials=30, n_splits=4,
             purge_gap=10, embargo_gap=5, is_classifier=True
@@ -267,10 +350,17 @@ def run_hyperparameter_tuning(first_parquet_path: str) -> None:
             purge_gap=15, embargo_gap=10, is_classifier=False
         )
 
+        print("  -> Running Optuna trials for Model 3b (Runup Regressor)...")
+        best_m3b = optimize_hyperparameters(
+            X_1min, y_runup, RunupModel, n_trials=30, n_splits=4,
+            purge_gap=15, embargo_gap=10, is_classifier=False
+        )
+
         all_best = {
             "model_1_direction": best_m1,
             "model_2_price": best_m2,
-            "model_3_exhaustion": best_m3
+            "model_3_exhaustion": best_m3,
+            "model_3b_runup": best_m3b
         }
 
         os.makedirs(os.path.dirname(BEST_HYPERPARAMS_PATH), exist_ok=True)
@@ -279,18 +369,21 @@ def run_hyperparameter_tuning(first_parquet_path: str) -> None:
 
         print(f"  [Optuna Tuning] Complete! Best hyperparameters saved to: {BEST_HYPERPARAMS_PATH}")
         print("=" * 70 + "\n")
-        del df_raw, df_1min, df_5min, X_5min, y_dir, y_price, X_1min, y_exhaust
+        del df_raw, df_1min, df_5min, X_5min, y_dir, y_price, X_1min, y_exhaust, y_runup
         gc.collect()
     except Exception as e:
         print(f"  ERROR during Optuna hyperparameter tuning: {e}")
 
 
-def train_all_companies(tune_hyperparams: bool = False) -> None:
+def train_all_companies(tune_hyperparams: bool = False, priority2_reset: bool = False) -> None:
     """
     Main training loop across all companies.
     Iterates through each Parquet file one by one (memory-safe incremental learning).
     """
     ensure_artifacts_dir()
+
+    if priority2_reset:
+        perform_priority2_reset()
 
     # Find all Parquet files
     parquet_files = sorted(glob.glob(os.path.join(PARQUET_DIR, "*.parquet")))
@@ -300,7 +393,7 @@ def train_all_companies(tune_hyperparams: bool = False) -> None:
         print("Run preprocess_to_parquet.py first!")
         return
 
-    # Fix Group D: If hyperparameter tuning requested, run Optuna on first company before main loop
+    # If hyperparameter tuning requested, run Optuna on first company before main loop
     if tune_hyperparams and len(parquet_files) > 0:
         run_hyperparameter_tuning(parquet_files[0])
 
@@ -308,6 +401,7 @@ def train_all_companies(tune_hyperparams: bool = False) -> None:
     model_1 = DirectionalModel(MODEL_1_PATH)
     model_2 = PriceModel(MODEL_2_PATH)
     model_3 = ExhaustionModel(MODEL_3_PATH)
+    model_3b = RunupModel(MODEL_3B_PATH)
 
     # Initialize monitoring
     logger = MetricsLogger(os.path.join(ARTIFACTS_DIR, "training_log.json"))
@@ -335,11 +429,11 @@ def train_all_companies(tune_hyperparams: bool = False) -> None:
         # --- STEP 2: Engineer Features ---
         print("  [Step 2] Feature Engineering via feature_engine/pipeline.py...")
         try:
-            print("    -> Calling build_features_1min() for Model 3 (Exhaustion indicators, VWAP, RSI, Volume Z)...")
+            print("    -> Calling build_features_1min() for Models 3 & 3b (Exhaustion indicators, VWAP, RSI, Volume Z, Relative Vol TOD, Bollinger)...")
             df_1min = build_features_1min(df)
             print(f"       1-min features ready: {df_1min.shape[0]:,} rows x {df_1min.shape[1]} columns")
 
-            print("    -> Calling build_features_5min() for Models 1 & 2 (OHLCV 5m aggregation + Z-scores)...")
+            print("    -> Calling build_features_5min() for Models 1 & 2 (OHLCV 5m aggregation + Z-scores + Bollinger)...")
             df_5min = build_features_5min(df)
             print(f"       5-min features ready: {df_5min.shape[0]:,} rows x {df_5min.shape[1]} columns")
         except Exception as e:  # noqa: BLE001
@@ -354,7 +448,7 @@ def train_all_companies(tune_hyperparams: bool = False) -> None:
             gc.collect()
             continue
 
-        # --- STEP 3: Inject Cross-Asset Signals (Model 1) ---
+        # --- STEP 3: Inject Cross-Asset Signals (Models 1 & 2) ---
         print("  [Step 3] Cross-Asset Signal Injection via correlation/cross_asset.py...")
         if os.path.exists(PEER_MAP_PATH):
             try:
@@ -380,12 +474,17 @@ def train_all_companies(tune_hyperparams: bool = False) -> None:
         drop_cols = [
             'date', 'symbol', 'open', 'high', 'low', 'close', 'volume',
             'mid_price', 'future_close_5m', 'target', '__target_dir',
-            '__target_price', '__target_exhaust', '__symbol'
+            '__target_price', '__target_exhaust', '__target_runup',
+            '__barrier_distance_pct', '__symbol'
         ]
 
-        # Model 1 & 2 Targets: aligned to 5-minute index
-        print("    -> Model 1: model_1.prepare_target() (Next 5m binary direction: UP=1, DOWN=0)")
-        y_dir_df = model_1.prepare_target(df_5min)
+        # Model 1: Cost-Aware Triple-Barrier Labeling (3 classes)
+        print("    -> Model 1: model_1.prepare_target() (Triple-Barrier 3-class: DOWN=0, FLAT=1, UP=2, >=2x cost)")
+        y_dir_df = model_1.prepare_target(df_5min, df_1min=df_1min)
+        if i == 0:
+            model_1.get_class_distribution(y_dir_df['target'])
+
+        # Model 2: Next 1m bar return
         print("    -> Model 2: model_2.prepare_target() (Section 13: 1m return of first bar in next window)")
         y_price_df = model_2.prepare_target(df_5min, df_1min=df_1min)
 
@@ -399,28 +498,39 @@ def train_all_companies(tune_hyperparams: bool = False) -> None:
         y_price = pd.Series(targets_5m.loc[common_idx_5m, 'target_price'])
 
         # Clean 5-min features and targets together
-        valid_5m = X_5min.replace([np.inf, -np.inf], np.nan).notna().all(axis=1) & y_dir.replace([np.inf, -np.inf], np.nan).notna() & y_price.replace([np.inf, -np.inf], np.nan).notna()
+        valid_5m = (
+            X_5min.replace([np.inf, -np.inf], np.nan).notna().all(axis=1)
+            & y_dir.replace([np.inf, -np.inf], np.nan).notna()
+            & y_price.replace([np.inf, -np.inf], np.nan).notna()
+        )
         X_5min = pd.DataFrame(X_5min[valid_5m])
         y_dir = pd.Series(y_dir[valid_5m])
         y_price = pd.Series(y_price[valid_5m])
 
         # Model 3: Maximum 10-minute forward drawdown
         print("    -> Model 3: model_3.prepare_target() (10-minute forward maximum drawdown)")
-        df_1min_with_target = model_3.prepare_target(df_1min)
-        y_exhaust_raw = pd.Series(df_1min_with_target['target'])
-        X_1min_raw = pd.DataFrame(df_1min_with_target[[c for c in df_1min_with_target.columns if c not in drop_cols]])
-        X_1min, y_exhaust = clean_data(X_1min_raw, y_exhaust_raw)
+        df_1min_target_exh = model_3.prepare_target(df_1min)
+
+        # Model 3b: Maximum 10-minute forward upside runup
+        print("    -> Model 3b: model_3b.prepare_target() (10-minute forward maximum upside runup)")
+        df_1min_target_run = model_3b.prepare_target(df_1min)
+
+        common_1m = df_1min_target_exh.index.intersection(df_1min_target_run.index)
+        y_exhaust_raw = pd.Series(df_1min_target_exh.loc[common_1m, 'target'], name='target_exh')
+        y_runup_raw = pd.Series(df_1min_target_run.loc[common_1m, 'target'], name='target_runup')
+        X_1min_raw = pd.DataFrame(df_1min.loc[common_1m, [c for c in df_1min.columns if c not in drop_cols]])
+        X_1min, y_exhaust, y_runup = clean_data_1min(X_1min_raw, y_exhaust_raw, y_runup_raw)
 
         print(f"    -> Clean aligned samples: 5-min = {len(X_5min):,} rows ({X_5min.shape[1]} features) | 1-min = {len(X_1min):,} rows ({X_1min.shape[1]} features)")
 
         if len(X_5min) < 50 or len(X_1min) < 50:
             print(f"    SKIPPING {symbol}: Not enough clean data.")
-            del df, df_1min, df_5min, targets_5m, df_1min_with_target, y_dir_df, y_price_df
+            del df, df_1min, df_5min, targets_5m, df_1min_target_exh, df_1min_target_run, y_dir_df, y_price_df
             gc.collect()
             continue
 
         # Free raw data frames
-        del df, df_1min, df_5min, targets_5m, df_1min_with_target, y_dir_df, y_price_df
+        del df, df_1min, df_5min, targets_5m, df_1min_target_exh, df_1min_target_run, y_dir_df, y_price_df
         gc.collect()
 
         # --- STEP 5: Feature Drift Detection (PSI) ---
@@ -460,19 +570,22 @@ def train_all_companies(tune_hyperparams: bool = False) -> None:
 
         replay_1 = load_replay_1min()
         if replay_1 is not None and models_initialized:
-            X_replay_1, y_exhaust_replay = replay_1
+            X_replay_1, y_exhaust_replay, y_runup_replay = replay_1
             common_cols_1 = [c for c in X_1min.columns if c in X_replay_1.columns]
             if len(common_cols_1) > 0:
                 X_1min_train = pd.concat([X_1min[common_cols_1], X_replay_1[common_cols_1]], ignore_index=True)
                 y_exhaust_train = pd.concat([y_exhaust, y_exhaust_replay], ignore_index=True)
+                y_runup_train = pd.concat([y_runup, y_runup_replay], ignore_index=True)
                 print(f"    -> Mixed 1-min replay: {len(X_replay_1):,} buffer rows + {len(X_1min):,} current rows = {len(X_1min_train):,} total")
             else:
                 X_1min_train = X_1min
                 y_exhaust_train = y_exhaust
-            del replay_1, X_replay_1, y_exhaust_replay
+                y_runup_train = y_runup
+            del replay_1, X_replay_1, y_exhaust_replay, y_runup_replay
         else:
             X_1min_train = X_1min
             y_exhaust_train = y_exhaust
+            y_runup_train = y_runup
             print(f"    -> 1-min dataset ready: {len(X_1min_train):,} samples (no prior replay buffer)")
 
         gc.collect()
@@ -500,25 +613,28 @@ def train_all_companies(tune_hyperparams: bool = False) -> None:
         X_va1 = pd.DataFrame(X_1min_train.iloc[val_idx_1m])
         y_tr_exh = pd.Series(y_exhaust_train.iloc[train_idx_1m])
         y_va_exh = pd.Series(y_exhaust_train.iloc[val_idx_1m])
+        y_tr_runup = pd.Series(y_runup_train.iloc[train_idx_1m])
+        y_va_runup = pd.Series(y_runup_train.iloc[val_idx_1m])
 
-        print(f"    -> 5-min CV fold (validation/purged_cv.py): Train={len(X_tr5):,} rows, Val={len(X_va5):,} rows (purge=10, embargo=5)")
-        print(f"    -> 1-min CV fold (validation/purged_cv.py): Train={len(X_tr1):,} rows, Val={len(X_va1):,} rows (purge=15, embargo=10)")
+        print(f"    -> 5-min CV fold: Train={len(X_tr5):,} rows, Val={len(X_va5):,} rows (purge=10, embargo=5)")
+        print(f"    -> 1-min CV fold: Train={len(X_tr1):,} rows, Val={len(X_va1):,} rows (purge=15, embargo=10)")
 
         # Model paths for incremental warm-start
         prev_m1 = MODEL_1_PATH if models_initialized and os.path.exists(MODEL_1_PATH) else None
         prev_m2 = MODEL_2_PATH if models_initialized and os.path.exists(MODEL_2_PATH) else None
         prev_m3 = MODEL_3_PATH if models_initialized and os.path.exists(MODEL_3_PATH) else None
+        prev_m3b = MODEL_3B_PATH if models_initialized and os.path.exists(MODEL_3B_PATH) else None
 
         acc = 0.0
         rmse_price = 0.0
         rmse_exh = 0.0
+        rmse_runup = 0.0
 
-        # --- Model 1: Directional Classifier ---
+        # --- Model 1: Directional 3-Class Classifier ---
         mode_m1 = "incremental warm-start (xgb_model=prev)" if prev_m1 else "initial training from scratch"
         print(f"    -> [Model 1: Direction] Calling models.model_1_direction.DirectionalModel.train() ({mode_m1})...")
         try:
             model_1.train(X_tr5, y_tr_dir, X_va5, y_va_dir, xgb_model=prev_m1)
-            # Fix Group A.2: Evaluate across ALL walk-forward CV folds for honest out-of-fold validation
             fold_accs = []
             for f_idx, (_, f_val_idx) in enumerate(folds_5m):
                 f_X_va = pd.DataFrame(X_5min_train.iloc[f_val_idx])
@@ -544,7 +660,6 @@ def train_all_companies(tune_hyperparams: bool = False) -> None:
         print(f"    -> [Model 2: Price Return] Calling models.model_2_price.PriceModel.train() ({mode_m2})...")
         try:
             model_2.train(X_tr5, y_tr_price, X_va5, y_va_price, xgb_model=prev_m2)
-            # Fix Group A.2: Evaluate across ALL walk-forward CV folds for honest out-of-fold validation
             fold_rmses_price = []
             for f_idx, (_, f_val_idx) in enumerate(folds_5m):
                 f_X_va = pd.DataFrame(X_5min_train.iloc[f_val_idx])
@@ -569,7 +684,6 @@ def train_all_companies(tune_hyperparams: bool = False) -> None:
         print(f"    -> [Model 3: Exhaustion] Calling models.model_3_exhaustion.ExhaustionModel.train() ({mode_m3})...")
         try:
             model_3.train(X_tr1, y_tr_exh, X_va1, y_va_exh, xgb_model=prev_m3)
-            # Fix Group A.2: Evaluate across ALL walk-forward CV folds for honest out-of-fold validation
             fold_rmses_exh = []
             for f_idx, (_, f_val_idx) in enumerate(folds_1m):
                 f_X_va = pd.DataFrame(X_1min_train.iloc[f_val_idx])
@@ -589,10 +703,34 @@ def train_all_companies(tune_hyperparams: bool = False) -> None:
         except Exception as e:  # noqa: BLE001
             print(f"       ERROR training Model 3: {e}")
 
+        # --- Model 3b: Runup Regressor ---
+        mode_m3b = "incremental warm-start (xgb_model=prev)" if prev_m3b else "initial training from scratch"
+        print(f"    -> [Model 3b: Runup] Calling models.model_3b_runup.RunupModel.train() ({mode_m3b})...")
+        try:
+            model_3b.train(X_tr1, y_tr_runup, X_va1, y_va_runup, xgb_model=prev_m3b)
+            fold_rmses_runup = []
+            for f_idx, (_, f_val_idx) in enumerate(folds_1m):
+                f_X_va = pd.DataFrame(X_1min_train.iloc[f_val_idx])
+                f_y_va = pd.Series(y_runup_train.iloc[f_val_idx])
+                f_preds = model_3b.predict(f_X_va)
+                fold_rmses_runup.append(float(np.sqrt(mean_squared_error(f_y_va, f_preds))))
+            rmse_runup = float(np.mean(fold_rmses_runup))
+            model_3b.save(MODEL_3B_PATH)
+            logger.log(symbol, "model_3b_runup", {
+                "rmse": round(rmse_runup, 6),
+                "last_fold_rmse": round(fold_rmses_runup[-1], 6),
+                "all_fold_rmses": [round(r, 6) for r in fold_rmses_runup],
+                "n_folds": len(fold_rmses_runup),
+                "val_size": len(X_va1)
+            })
+            print(f"       Model 3b Result: Mean Val RMSE (across {len(fold_rmses_runup)} folds) = {rmse_runup:.6f} (Last fold: {fold_rmses_runup[-1]:.6f}) (Saved to {os.path.basename(MODEL_3B_PATH)})")
+        except Exception as e:  # noqa: BLE001
+            print(f"       ERROR training Model 3b: {e}")
+
         # --- STEP 8: Update Replay Buffers ---
         print(f"  [Step 8] Updating replay buffers on disk with 5% historical sample of {symbol}...")
         update_replay_buffer_5min(X_5min, y_dir, y_price, symbol)
-        update_replay_buffer_1min(X_1min, y_exhaust, symbol)
+        update_replay_buffer_1min(X_1min, y_exhaust, y_runup, symbol)
         print("    -> Replay buffers updated (replay_buffer_5min.parquet & replay_buffer_1min.parquet)")
 
         models_initialized = True
@@ -601,7 +739,7 @@ def train_all_companies(tune_hyperparams: bool = False) -> None:
         if (i + 1) % 25 == 0 and i > 0:
             print("\n  ******************************************************************")
             print(f"  *** [Step 9] PERIODIC FULL RETRAIN TRIGGERED (after {i+1} companies) ***")
-            print("  *** Retraining Models 1, 2, and 3 from full historical replay buffer ***")
+            print("  *** Retraining Models 1, 2, 3, and 3b from full historical replay buffer ***")
             print("  ******************************************************************")
             try:
                 # Retrain Model 1 & Model 2 (from 5-min replay buffer)
@@ -610,7 +748,7 @@ def train_all_companies(tune_hyperparams: bool = False) -> None:
                     Xr_raw, yr_dir_raw, yr_price_raw = replay_5
                     print(f"    -> Loaded 5-min replay buffer: {len(Xr_raw):,} total historical samples")
 
-                    # Retrain Model 1 (Directional Classifier)
+                    # Retrain Model 1 (Directional 3-Class Classifier)
                     valid_r5_m1 = Xr_raw.replace([np.inf, -np.inf], np.nan).notna().all(axis=1) & yr_dir_raw.notna()
                     Xr_m1 = pd.DataFrame(Xr_raw[valid_r5_m1])
                     yr_dir = pd.Series(yr_dir_raw[valid_r5_m1])
@@ -646,15 +784,18 @@ def train_all_companies(tune_hyperparams: bool = False) -> None:
                     print("       Model 2 successfully retrained from full replay buffer.")
                     del replay_5, Xr_raw, yr_dir_raw, yr_price_raw, Xr_m2, yr_price
 
-                # Retrain Model 3 (Exhaustion Regressor)
+                # Retrain Models 3 & 3b (from 1-min replay buffer)
                 replay_1 = load_replay_1min()
                 if replay_1 is not None:
-                    Xr1, yr_exh = replay_1
+                    Xr1, yr_exh, yr_runup = replay_1
                     print(f"    -> Loaded 1-min replay buffer: {len(Xr1):,} total historical samples")
-                    valid_r1 = Xr1.replace([np.inf, -np.inf], np.nan).notna().all(axis=1) & yr_exh.notna()
+                    valid_r1 = Xr1.replace([np.inf, -np.inf], np.nan).notna().all(axis=1) & yr_exh.notna() & yr_runup.notna()
                     Xr1 = pd.DataFrame(Xr1[valid_r1])
                     yr_exh = pd.Series(yr_exh[valid_r1])
+                    yr_runup = pd.Series(yr_runup[valid_r1])
                     sp3 = int(len(Xr1) * 0.8)
+
+                    # Model 3
                     print(f"    -> [Retrain M3] ExhaustionModel: Training fresh on {sp3:,} samples, validating on {len(Xr1)-sp3:,}...")
                     model_3_fresh = ExhaustionModel()
                     model_3_fresh.train(
@@ -666,7 +807,20 @@ def train_all_companies(tune_hyperparams: bool = False) -> None:
                     model_3_fresh.save(MODEL_3_PATH)
                     model_3 = model_3_fresh
                     print("       Model 3 successfully retrained from full replay buffer.")
-                    del replay_1, Xr1, yr_exh
+
+                    # Model 3b
+                    print(f"    -> [Retrain M3b] RunupModel: Training fresh on {sp3:,} samples, validating on {len(Xr1)-sp3:,}...")
+                    model_3b_fresh = RunupModel()
+                    model_3b_fresh.train(
+                        pd.DataFrame(Xr1.iloc[:sp3]),
+                        pd.Series(yr_runup.iloc[:sp3]),
+                        pd.DataFrame(Xr1.iloc[sp3:]),
+                        pd.Series(yr_runup.iloc[sp3:])
+                    )
+                    model_3b_fresh.save(MODEL_3B_PATH)
+                    model_3b = model_3b_fresh
+                    print("       Model 3b successfully retrained from full replay buffer.")
+                    del replay_1, Xr1, yr_exh, yr_runup
 
                 gc.collect()
             except Exception as e:  # noqa: BLE001
@@ -674,17 +828,17 @@ def train_all_companies(tune_hyperparams: bool = False) -> None:
 
         # --- STEP 10: Strict Memory Cleanup ---
         print("  [Step 10] Memory Cleanup: Releasing temporary DataFrames & running gc.collect()...")
-        del X_5min, X_1min, y_dir, y_exhaust, y_price
-        del X_5min_train, X_1min_train, y_dir_train, y_exhaust_train, y_price_train
+        del X_5min, X_1min, y_dir, y_exhaust, y_runup, y_price
+        del X_5min_train, X_1min_train, y_dir_train, y_exhaust_train, y_runup_train, y_price_train
         del X_tr5, X_va5, X_tr1, X_va1
-        del y_tr_dir, y_va_dir, y_tr_exh, y_va_exh, y_tr_price, y_va_price
+        del y_tr_dir, y_va_dir, y_tr_exh, y_va_exh, y_tr_runup, y_va_runup, y_tr_price, y_va_price
         gc.collect()
         print("    -> Cleaned. Peak RAM flat at < 2 GB.")
-        print(f"  Finished {symbol} -> [M1 Acc: {acc*100:.2f}%, M2 RMSE: {rmse_price:.6f}, M3 RMSE: {rmse_exh:.6f}]")
+        print(f"  Finished {symbol} -> [M1 Acc: {acc*100:.2f}%, M2 RMSE: {rmse_price:.6f}, M3 RMSE: {rmse_exh:.6f}, M3b RMSE: {rmse_runup:.6f}]")
 
     print("\n" + "=" * 70)
     print("INCREMENTAL TRAINING PIPELINE COMPLETE!")
-    print(f"All 3 Models Saved to: {ARTIFACTS_DIR}")
+    print(f"All 4 Models Saved to: {ARTIFACTS_DIR}")
     print(f"Training log: {os.path.join(ARTIFACTS_DIR, 'training_log.json')}")
     print(f"Drift log: {os.path.join(ARTIFACTS_DIR, 'drift_log.json')}")
     print("=" * 70)
@@ -698,5 +852,10 @@ if __name__ == "__main__":
         action="store_true",
         help="Run Optuna Bayesian hyperparameter tuning on first company before streaming incremental loop"
     )
+    parser.add_argument(
+        "--priority2-reset",
+        action="store_true",
+        help="Perform Priority-2 reset (archive pre_priority2 artifacts, purge replay buffers)"
+    )
     args = parser.parse_args()
-    train_all_companies(tune_hyperparams=args.tune_hyperparams)
+    train_all_companies(tune_hyperparams=args.tune_hyperparams, priority2_reset=args.priority2_reset)

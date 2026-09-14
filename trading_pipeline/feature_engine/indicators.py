@@ -136,3 +136,71 @@ class TechnicalIndicators:
         }, index=df.index)
         
         return result
+
+    def relative_volume_time_of_day(self, df: pd.DataFrame, historical_window_days: int = 30) -> pd.Series:
+        """
+        Calculates time-of-day relative volume.
+        Compares current volume to the historical average volume for the same minute-of-day
+        across the previous `historical_window_days` trading days.
+        
+        Args:
+            df (pd.DataFrame): DataFrame containing 'volume' and a DatetimeIndex.
+            historical_window_days (int): Lookback window in days (sessions). Default is 30.
+            
+        Returns:
+            pd.Series: Relative volume for the time of day.
+        """
+        sessions = self._get_session_groups(df.index)
+        mod = df.index.hour * 60 + df.index.minute
+        
+        temp = pd.DataFrame({'vol': df['volume'], 'mod': mod, 'session': sessions})
+        
+        def _calc_baseline(x):
+            return x.shift(1).rolling(window=historical_window_days, min_periods=1).mean()
+            
+        hist_avg = temp.groupby('mod')['vol'].transform(_calc_baseline)
+        
+        rel_vol = temp['vol'] / hist_avg
+        rel_vol = rel_vol.where(hist_avg.notna(), 1.0)
+        rel_vol = rel_vol.where(hist_avg != 0, 1.0)
+        
+        return pd.Series(rel_vol, index=df.index, name='relative_volume_tod')
+
+    def bollinger_bands(self, series: pd.Series, window: int = 20, num_std: float = 2.0) -> pd.DataFrame:
+        """
+        Calculates Bollinger Bands features with session-resetting.
+        
+        Args:
+            series (pd.Series): Price series.
+            window (int): Rolling window size. Default is 20.
+            num_std (float): Number of standard deviations for bands. Default is 2.0.
+            
+        Returns:
+            pd.DataFrame: DataFrame containing 'bollinger_pctb', 'bollinger_dist_upper', 
+                          and 'bollinger_bandwidth'.
+        """
+        groups = self._get_session_groups(series.index)
+        
+        def _calc_bb(group_series: pd.Series) -> pd.DataFrame:
+            middle = group_series.rolling(window=window).mean().shift(1)
+            rolling_std_val = group_series.rolling(window=window).std().shift(1)
+            
+            upper = middle + num_std * rolling_std_val
+            lower = middle - num_std * rolling_std_val
+            
+            pctb = (group_series - lower) / (upper - lower)
+            dist_upper = (group_series - upper) / upper
+            bandwidth = (upper - lower) / middle
+            
+            zero_width = (upper == lower)
+            pctb = pctb.mask(zero_width, 0.5)
+            dist_upper = dist_upper.mask(zero_width, 0.0)
+            bandwidth = bandwidth.mask(zero_width, 0.0)
+            
+            return pd.DataFrame({
+                'bollinger_pctb': pctb,
+                'bollinger_dist_upper': dist_upper,
+                'bollinger_bandwidth': bandwidth
+            }, index=group_series.index)
+            
+        return series.groupby(groups, group_keys=False).apply(_calc_bb)

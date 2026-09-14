@@ -96,53 +96,203 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return atr
 
 
+from dataclasses import dataclass
+from config import (
+    EXIT_MAX_HOLD_BARS,
+    EXIT_STOP_LOSS_ATR_MULT,
+    EXIT_TAKE_PROFIT_SAFETY,
+    EXIT_TRAILING_PCT,
+    KELLY_FRACTION,
+    POSITION_SIZING_METHOD,
+)
+
+
+def calculate_kelly_position_size(
+    capital: float,
+    calibrated_prob: float,
+    predicted_runup: float,
+    atr: float,
+    price: float,
+    realized_trades: list[float] | None = None,
+    fraction: float = KELLY_FRACTION,
+    max_position_pct: float = 0.10,
+) -> float:
+    """
+    Calculates position size using fractional Kelly Criterion.
+
+    Formula (ExitManager aligned):
+        b = (0.7 * predicted_runup) / (1.5 * ATR_pct)
+        If >= 50 realized trades exist: b = avg_win / avg_loss from history.
+        f* = fraction * (p - (1 - p) / b)
+    """
+    if price <= 0 or atr <= 0 or calibrated_prob <= 0:
+        return 0.0
+
+    p = float(calibrated_prob)
+    atr_pct = atr / price
+
+    if realized_trades and len(realized_trades) >= 50:
+        wins = [t for t in realized_trades if t > 0]
+        losses = [abs(t) for t in realized_trades if t < 0]
+        if wins and losses:
+            b = float(np.mean(wins) / np.mean(losses))
+        else:
+            b = (EXIT_TAKE_PROFIT_SAFETY * max(predicted_runup, 0.002)) / (EXIT_STOP_LOSS_ATR_MULT * max(atr_pct, 0.001))
+    else:
+        b = (EXIT_TAKE_PROFIT_SAFETY * max(predicted_runup, 0.002)) / (EXIT_STOP_LOSS_ATR_MULT * max(atr_pct, 0.001))
+
+    if b <= 0:
+        return 0.0
+
+    f_star = fraction * (p - (1.0 - p) / b)
+
+    if f_star <= 0:
+        return 0.0
+
+    f_capped = min(f_star, max_position_pct)
+    position_value = capital * f_capped
+    shares = position_value / price
+
+    return max(0.0, float(shares))
+
+
 def calculate_position_size(
     capital: float,
     risk_pct: float,
     atr: float,
     price: float,
-    max_position_pct: float = 0.10
+    max_position_pct: float = 0.10,
+    calibrated_prob: float | None = None,
+    predicted_runup: float | None = None,
+    sizing_method: str = POSITION_SIZING_METHOD,
+    realized_trades: list[float] | None = None,
 ) -> float:
     """
-    Calculates position size using ATR-adjusted fractional sizing.
-    
-    Instead of always betting 2% of capital, we adjust based on volatility:
-    - Low volatility stock (small ATR) → Larger position (more shares)
-    - High volatility stock (large ATR) → Smaller position (fewer shares)
-    
-    Formula:
-        Risk Amount = Capital * Risk%
-        Shares = Risk Amount / (ATR * 2)  (2x ATR as stop-loss distance)
-        Position Value = Shares * Price
-        Cap at max_position_pct of capital
-    
-    Args:
-        capital: Current portfolio value.
-        risk_pct: Fraction of capital to risk (e.g., 0.02 = 2%).
-        atr: Current ATR value for the stock.
-        price: Current stock price.
-        max_position_pct: Maximum fraction of capital for a single position.
-    
-    Returns:
-        Number of shares to trade (float, round down for actual orders).
+    Calculates position size using configurable sizing methods:
+    - 'atr'   : Volatility-adjusted fractional risk sizing
+    - 'kelly' : Fractional Kelly Criterion using ExitManager-derived win/loss ratio
+    - 'hybrid': Conservative minimum of ATR sizing and Kelly sizing
     """
     if atr <= 0 or price <= 0:
         return 0.0
-    
-    # Amount we're willing to lose on this trade
+
+    # 1. ATR sizing
     risk_amount = capital * risk_pct
-    
-    # Stop-loss distance = 2x ATR (a common professional rule of thumb)
-    stop_distance = atr * 2.0
-    
-    # Number of shares where hitting the stop-loss = losing exactly risk_amount
-    shares = risk_amount / stop_distance
-    
-    # Cap the total position value at max_position_pct of capital
+    stop_distance = atr * EXIT_STOP_LOSS_ATR_MULT
+    atr_shares = risk_amount / stop_distance
     max_shares = (capital * max_position_pct) / price
-    shares = min(shares, max_shares)
-    
-    return max(0.0, shares)
+    atr_shares = min(atr_shares, max_shares)
+
+    if sizing_method == "atr" or calibrated_prob is None or predicted_runup is None:
+        return max(0.0, float(atr_shares))
+
+    # 2. Kelly sizing
+    kelly_shares = calculate_kelly_position_size(
+        capital=capital,
+        calibrated_prob=calibrated_prob,
+        predicted_runup=predicted_runup,
+        atr=atr,
+        price=price,
+        realized_trades=realized_trades,
+        fraction=KELLY_FRACTION,
+        max_position_pct=max_position_pct,
+    )
+
+    if sizing_method == "kelly":
+        return max(0.0, float(kelly_shares))
+    elif sizing_method == "hybrid":
+        return max(0.0, float(min(atr_shares, kelly_shares)))
+    else:
+        return max(0.0, float(atr_shares))
+
+
+@dataclass
+class ExitDecision:
+    """Dataclass returned by ExitManager."""
+    should_exit: bool
+    exit_reason: str  # 'STOP_LOSS', 'TAKE_PROFIT', 'TRAILING_STOP', 'TIME_EXIT', or 'HOLD'
+    exit_price: float
+
+
+class ExitManager:
+    """
+    Multi-barrier exit manager for open positions (Fix Group 8).
+    Evaluates:
+      1. Hard Stop-Loss (1.5x ATR from entry)
+      2. Take-Profit (Model 3b predicted runup * 0.7)
+      3. Trailing Stop (ratchets 0.5% once excursion is favorable)
+      4. Time-based fallback exit (5 bars)
+    """
+
+    def __init__(
+        self,
+        stop_loss_atr_mult: float = EXIT_STOP_LOSS_ATR_MULT,
+        take_profit_safety: float = EXIT_TAKE_PROFIT_SAFETY,
+        trailing_pct: float = EXIT_TRAILING_PCT,
+        max_hold_bars: int = EXIT_MAX_HOLD_BARS,
+    ) -> None:
+        self.stop_loss_atr_mult = stop_loss_atr_mult
+        self.take_profit_safety = take_profit_safety
+        self.trailing_pct = trailing_pct
+        self.max_hold_bars = max_hold_bars
+
+    def evaluate_exit(
+        self,
+        direction: int,            # +1 (Long) or -1 (Short)
+        entry_price: float,
+        entry_atr: float,
+        current_price: float,
+        highest_price: float,
+        lowest_price: float,
+        bars_held: int,
+        predicted_runup: float = 0.01,
+    ) -> ExitDecision:
+        """
+        Evaluates whether an open position should be closed on the current bar.
+        """
+        if direction == 1:  # LONG POSITION
+            # 1. Hard Stop-Loss
+            stop_level = entry_price - (self.stop_loss_atr_mult * entry_atr)
+            if current_price <= stop_level:
+                return ExitDecision(True, "STOP_LOSS", current_price)
+
+            # 2. Take-Profit from Model 3b Runup
+            tp_target = entry_price * (1.0 + self.take_profit_safety * max(predicted_runup, 0.003))
+            if current_price >= tp_target:
+                return ExitDecision(True, "TAKE_PROFIT", current_price)
+
+            # 3. Trailing Stop: ratchets once position moves favorable by trailing_pct
+            if highest_price >= entry_price * (1.0 + self.trailing_pct):
+                trail_stop = highest_price * (1.0 - self.trailing_pct)
+                if current_price <= trail_stop:
+                    return ExitDecision(True, "TRAILING_STOP", current_price)
+
+            # 4. Time-based fallback
+            if bars_held >= self.max_hold_bars:
+                return ExitDecision(True, "TIME_EXIT", current_price)
+
+        elif direction == -1:  # SHORT POSITION
+            # 1. Hard Stop-Loss
+            stop_level = entry_price + (self.stop_loss_atr_mult * entry_atr)
+            if current_price >= stop_level:
+                return ExitDecision(True, "STOP_LOSS", current_price)
+
+            # 2. Take-Profit
+            tp_target = entry_price * (1.0 - self.take_profit_safety * max(predicted_runup, 0.003))
+            if current_price <= tp_target:
+                return ExitDecision(True, "TAKE_PROFIT", current_price)
+
+            # 3. Trailing Stop
+            if lowest_price <= entry_price * (1.0 - self.trailing_pct):
+                trail_stop = lowest_price * (1.0 + self.trailing_pct)
+                if current_price >= trail_stop:
+                    return ExitDecision(True, "TRAILING_STOP", current_price)
+
+            # 4. Time-based fallback
+            if bars_held >= self.max_hold_bars:
+                return ExitDecision(True, "TIME_EXIT", current_price)
+
+        return ExitDecision(False, "HOLD", current_price)
 
 
 class PortfolioState:

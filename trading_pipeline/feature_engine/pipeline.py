@@ -90,7 +90,14 @@ def build_features_1min(df: pd.DataFrame) -> pd.DataFrame:
     # Join exhaustion features
     df = df.join(exhaustion_df)
     
-    # 4. Drop NaN rows resulting from rolling windows and shifts
+    # 4. Time-of-day relative volume
+    df['relative_volume_tod'] = indicators.relative_volume_time_of_day(df)
+    
+    # 5. Bollinger Band features
+    bb = indicators.bollinger_bands(df['mid_price'], window=20, num_std=2.0)
+    df = df.join(bb)
+    
+    # 6. Drop NaN rows resulting from rolling windows and shifts
     df = df.dropna()
     
     # Clean inf and NaNs from rolling window startup
@@ -154,6 +161,12 @@ def build_features_5min(df: pd.DataFrame) -> pd.DataFrame:
     df_5m['price_vs_ema_zscore'] = zscore_calc.price_vs_ema_zscore(df_5m['mid_price'], span=20)
     df_5m['range_zscore'] = zscore_calc.range_zscore(df_5m['high'], df_5m['low'], window=20)
     df_5m['momentum_zscore'] = zscore_calc.momentum_zscore(df_5m['mid_price'], lag=3, window=20)
+    
+    # Bollinger Band features (5-min timeframe)
+    indicators = TechnicalIndicators()
+    bb_5m = indicators.bollinger_bands(df_5m['mid_price'], window=20, num_std=2.0)
+    df_5m['bollinger_pctb'] = bb_5m['bollinger_pctb']
+    df_5m['bollinger_bandwidth'] = bb_5m['bollinger_bandwidth']
     
     # 3. Drop NaN rows
     df_5m = df_5m.dropna()

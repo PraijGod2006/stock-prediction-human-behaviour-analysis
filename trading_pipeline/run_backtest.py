@@ -30,7 +30,19 @@ PARQUET_DIR = r"d:\CODE\rajasthani\DATA\parquet"
 ARTIFACTS_DIR = r"d:\CODE\rajasthani\trading_pipeline\artifacts"
 
 
-def run_backtest_on_symbol(symbol: str, model_1, model_2, model_3, engine: BacktestEngine):
+from backtest.risk_manager import PortfolioState, ExposureManager, CircuitBreaker
+
+
+def run_backtest_on_symbol(
+    symbol: str,
+    model_1,
+    model_2,
+    model_3,
+    model_3b,
+    calibrator,
+    meta_filter,
+    engine: BacktestEngine
+):
     """
     Runs inference + backtest on a single symbol.
     Uses the last 20% of data as the test set (simulating out-of-sample).
@@ -51,9 +63,26 @@ def run_backtest_on_symbol(symbol: str, model_1, model_2, model_3, engine: Backt
         print(f"  {symbol}: Not enough test data ({len(df_test)} rows), skipping.")
         return None
 
+    # Use fresh in-memory risk managers per backtest run to isolate historical tests
+    fresh_state = PortfolioState()
+    fresh_exp = ExposureManager(portfolio_state=fresh_state)
+    fresh_cb = CircuitBreaker(portfolio_state=fresh_state)
+
     # Generate signals
     try:
-        signals = generate_signals(df_test, symbol, model_1, model_2, model_3)
+        signals = generate_signals(
+            df_test,
+            symbol,
+            model_1,
+            model_2,
+            model_3,
+            model_3b=model_3b,
+            calibrator=calibrator,
+            meta_filter=meta_filter,
+            exposure_mgr=fresh_exp,
+            circuit_breaker=fresh_cb,
+            portfolio_state=fresh_state,
+        )
     except Exception as e:
         print(f"  {symbol}: Signal generation failed: {e}")
         return None
@@ -85,11 +114,11 @@ def main():
     Runs backtest across a sample of stocks and prints aggregate results.
     """
     print("=" * 70)
-    print("BACKTEST: Loading trained models...")
+    print("BACKTEST: Loading trained models & calibrator/meta-filter...")
     print("=" * 70)
 
     try:
-        model_1, model_2, model_3 = load_models()
+        model_1, model_2, model_3, model_3b, calibrator, meta_filter = load_models()
     except Exception as e:
         print(f"ERROR loading models: {e}")
         print("Run train_master.py first!")
@@ -106,7 +135,16 @@ def main():
     all_results = []
     for symbol in test_symbols:
         print(f"\n--- Backtesting {symbol} ---")
-        result = run_backtest_on_symbol(symbol, model_1, model_2, model_3, engine)
+        result = run_backtest_on_symbol(
+            symbol,
+            model_1,
+            model_2,
+            model_3,
+            model_3b,
+            calibrator,
+            meta_filter,
+            engine
+        )
         if result is not None:
             result['summary']['symbol'] = symbol
             all_results.append(result)

@@ -213,10 +213,13 @@ class BacktestEngine:
                             'entry_price': target_entry,
                             'direction': direction,
                             'shares': abs(shares),
-                            'entry_cost': cost
+                            'entry_cost': cost,
+                            'entry_atr': row.get('atr', target_entry * 0.005),
+                            'highest_price': target_entry,
+                            'lowest_price': target_entry,
                         })
             
-            # Exit logic: close position after 5 bars (simple time-based exit)
+            # Exit logic: Multi-barrier ExitManager (SL 1.5x ATR, TP 0.7x runup, Trailing stop 0.5%, Time 5 bars)
             if position != 0 and len(trades) > 0:
                 trade = trades[-1]
                 if 'exit_date' not in trade:
@@ -224,8 +227,25 @@ class BacktestEngine:
                         merged[merged['date'] == trade['entry_date']].index[0]
                     ) if trade['entry_date'] in merged['date'].values else 0
                     
-                    if bars_held >= 5:
-                        exit_price = row['ref_price']
+                    # Update peak favorable excursions
+                    trade['highest_price'] = max(trade.get('highest_price', entry_price), row.get('high', row['ref_price']))
+                    trade['lowest_price'] = min(trade.get('lowest_price', entry_price), row.get('low', row['ref_price']))
+                    
+                    from backtest.risk_manager import ExitManager
+                    exit_mgr = ExitManager()
+                    exit_dec = exit_mgr.evaluate_exit(
+                        direction=int(trade['direction']),
+                        entry_price=float(trade['entry_price']),
+                        entry_atr=float(trade.get('entry_atr', entry_price * 0.005)),
+                        current_price=float(row['ref_price']),
+                        highest_price=float(trade['highest_price']),
+                        lowest_price=float(trade['lowest_price']),
+                        bars_held=bars_held,
+                        predicted_runup=float(row.get('pred_runup', 0.01)),
+                    )
+                    
+                    if exit_dec.should_exit:
+                        exit_price = exit_dec.exit_price
                         pnl = (exit_price - entry_price) * position
                         exit_cost = self.cost_model.compute_cost(
                             abs(position) * exit_price, is_sell=True
@@ -234,6 +254,7 @@ class BacktestEngine:
                         
                         trade['exit_date'] = row['date']
                         trade['exit_price'] = exit_price
+                        trade['exit_reason'] = exit_dec.exit_reason
                         trade['pnl'] = pnl - exit_cost - trade['entry_cost']
                         trade['exit_cost'] = exit_cost
                         
